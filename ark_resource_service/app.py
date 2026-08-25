@@ -11,7 +11,8 @@ import threading
 import time
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
@@ -75,6 +76,15 @@ class Job:
     cancel_requested: bool = False
 
 
+@dataclass
+class PreparedAsset:
+    asset: dict[str, Any]
+    bundle: bytes
+    reservation: int
+    started: float
+    download_ms: int
+
+
 class UpdateRequest(BaseModel):
     dry_run: bool = False
 
@@ -83,6 +93,7 @@ class MemoryBudget:
     def __init__(self, limit_bytes: int):
         self.limit = limit_bytes
         self.used = 0
+        self.peak = 0
         self.condition = threading.Condition()
 
     def acquire(self, requested: int) -> None:
@@ -91,18 +102,25 @@ class MemoryBudget:
             while self.used and self.used + requested > self.limit:
                 self.condition.wait()
             self.used += requested
+            self.peak = max(self.peak, self.used)
 
     def release(self, requested: int) -> None:
         with self.condition:
             self.used = max(0, self.used - max(1, requested))
             self.condition.notify_all()
 
+    def snapshot(self) -> dict[str, int]:
+        with self.condition:
+            return {"limitBytes": self.limit, "usedBytes": self.used, "peakBytes": self.peak}
+
 
 class OfficialClient:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, download_pool_size: int = 2):
         self.root = root
         self.session = requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
+        self.download_pool_size = max(1, download_pool_size)
+        self.download_sessions = threading.local()
         self.version_url = ""
         self.cdn_root = ""
         self.etag = ""
@@ -111,6 +129,37 @@ class OfficialClient:
         self.last_checked_at = ""
         self.last_network_refresh = 0.0
         self.lock = threading.Lock()
+
+    def download_session(self) -> requests.Session:
+        session = getattr(self.download_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers["User-Agent"] = USER_AGENT
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=self.download_pool_size,
+                pool_maxsize=self.download_pool_size,
+                pool_block=True,
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            self.download_sessions.session = session
+        return session
+
+    def download_bytes(self, url: str, max_bytes: int) -> bytes:
+        output = io.BytesIO()
+        with self.download_session().get(url, stream=True, timeout=(30, 180)) as response:
+            response.raise_for_status()
+            declared = int(response.headers.get("Content-Length", "0") or 0)
+            if declared and declared > max_bytes:
+                raise RuntimeError(f"response exceeds configured memory allowance: {declared} > {max_bytes}")
+            for chunk in response.iter_content(1024 * 1024):
+                if chunk:
+                    output.write(chunk)
+                    if output.tell() > max_bytes:
+                        raise RuntimeError(
+                            f"stream exceeds configured memory allowance: {output.tell()} > {max_bytes}"
+                        )
+        return output.getvalue()
 
     def discover(self, force: bool = False) -> None:
         with self.lock:
@@ -161,7 +210,18 @@ class Service:
         self.legacy_root = Path(os.getenv("ARK_LEGACY_ROOT", "/nonexistent-legacy-root"))
         config = load_json(Path(os.getenv("ARK_CONFIG", "/app/config/service.json")), {})
         self.poll_seconds = max(2.0, float(os.getenv("ARK_POLL_SECONDS", config.get("pollSeconds", 5))))
-        self.workers = max(1, int(os.getenv("ARK_DOWNLOAD_WORKERS", config.get("downloadWorkers", 2))))
+        self.download_workers = max(
+            1, int(os.getenv("ARK_DOWNLOAD_WORKERS", config.get("downloadWorkers", 2)))
+        )
+        self.export_workers = max(
+            1, int(os.getenv("ARK_EXPORT_WORKERS", config.get("exportWorkers", 2)))
+        )
+        self.prefetch_bundles = max(
+            0, int(os.getenv("ARK_PREFETCH_BUNDLES", config.get("prefetchBundles", 2)))
+        )
+        self.decode_memory_factor = max(
+            1.0, float(os.getenv("ARK_DECODE_MEMORY_FACTOR", config.get("decodeMemoryFactor", 6.0)))
+        )
         self.bootstrap_packs = os.getenv("ARK_BOOTSTRAP_PACKS", str(config.get("bootstrapPacks", True))).lower() == "true"
         from .memory_unpacker import parse_export_types
 
@@ -182,10 +242,11 @@ class Service:
         self.memory_budget = MemoryBudget(self.memory_budget_mb * 1024 * 1024)
         self.unpacker_root = Path(os.getenv("ARK_UNPACKER_ROOT", "/opt/ark-unpacker"))
         self.memory_unpacker = None
-        self.client = OfficialClient(self.root)
+        self.client = OfficialClient(self.root, self.download_workers)
         self.jobs: dict[str, Job] = {}
         self.active_job: str | None = None
         self.lock = threading.Lock()
+        self.unpacker_lock = threading.Lock()
         self.records_lock = threading.Lock()
         self.records: dict[str, dict[str, Any]] = load_json(self.root / "State" / "unpacked_records.json", {})
         self.records_journal = self.root / "State" / "unpacked_records.jsonl"
@@ -256,17 +317,7 @@ class Service:
             job.total = len(missing)
             self.update(job, "downloading_unpacking", f"streaming and unpacking {len(missing)} resources")
             if missing:
-                with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                    futures = {pool.submit(self.download_one, job, base_url, a): a for a in missing}
-                    for future in as_completed(futures):
-                        if job.cancel_requested:
-                            for pending in futures:
-                                pending.cancel()
-                            raise InterruptedError("cancel requested")
-                        future.result()
-                        job.completed += 1
-                        if job.completed % 20 == 0:
-                            self.update(job, "downloading_unpacking", f"{job.completed}/{job.total}")
+                self.process_assets(job, base_url, missing)
             atomic_json(self.root / "State" / "hot_update_list.json", manifest)
             self.compact_records()
             job.status, job.phase, job.detail = "completed", "completed", "synchronized and unpacked"
@@ -331,33 +382,18 @@ class Service:
 
     def get_unpacker(self):
         if self.memory_unpacker is None:
-            from .memory_unpacker import MemoryUnpacker
+            with self.unpacker_lock:
+                if self.memory_unpacker is None:
+                    from .memory_unpacker import MemoryUnpacker
 
-            self.memory_unpacker = MemoryUnpacker(
-                self.unpacker_root,
-                self.output_root,
-                self.root / "Logs",
-                self.export_types,
-                self.typetree_types,
-            )
+                    self.memory_unpacker = MemoryUnpacker(
+                        self.unpacker_root,
+                        self.output_root,
+                        self.root / "Logs",
+                        self.export_types,
+                        self.typetree_types,
+                    )
         return self.memory_unpacker
-
-    @staticmethod
-    def download_bytes(url: str, max_bytes: int) -> bytes:
-        session = requests.Session()
-        session.headers["User-Agent"] = USER_AGENT
-        output = io.BytesIO()
-        with session.get(url, stream=True, timeout=(30, 180)) as response:
-            response.raise_for_status()
-            declared = int(response.headers.get("Content-Length", "0") or 0)
-            if declared and declared > max_bytes:
-                raise RuntimeError(f"response exceeds configured memory allowance: {declared} > {max_bytes}")
-            for chunk in response.iter_content(1024 * 1024):
-                if chunk:
-                    output.write(chunk)
-                    if output.tell() > max_bytes:
-                        raise RuntimeError(f"stream exceeds configured memory allowance: {output.tell()} > {max_bytes}")
-        return output.getvalue()
 
     def validate_and_unpack(self, job: Job, data: bytes, asset: dict[str, Any]) -> int:
         size = int(asset.get("abSize", 0) or 0)
@@ -421,7 +457,7 @@ class Service:
             self.memory_budget.acquire(reserve)
             try:
                 max_bytes = max(int(pack.get("totalSize", 0) or 0) + 1024 * 1024, 2 * 1024 * 1024)
-                archive = self.download_bytes(f"{base}/{name}.dat", max_bytes)
+                archive = self.client.download_bytes(f"{base}/{name}.dat", max_bytes)
                 self.process_archive_bytes(job, archive, allowed)
             finally:
                 self.memory_budget.release(reserve)
@@ -429,38 +465,161 @@ class Service:
             self.compact_records()
             atomic_json(state_path, {"version": version, "completed": sorted(completed)})
 
-    def download_one(self, job: Job, base: str, asset: dict[str, Any]) -> str:
+    def asset_reservation(self, asset: dict[str, Any]) -> int:
+        archive_size = int(asset.get("totalSize", 0) or 0)
+        bundle_size = int(asset.get("abSize", 0) or 0)
+        return max(int(archive_size + bundle_size * self.decode_memory_factor), 1024 * 1024)
+
+    def prepare_one(self, job: Job, base: str, asset: dict[str, Any]) -> PreparedAsset:
         name = asset["name"]
         started = time.monotonic()
         worker = threading.current_thread().name
         LOGGER.info(
-            "asset_start job=%s worker=%s name=%s downloadBytes=%s bundleBytes=%s",
+            "asset_download_start job=%s worker=%s name=%s downloadBytes=%s bundleBytes=%s",
             job.id,
             worker,
             name,
             asset.get("totalSize", 0),
             asset.get("abSize", 0),
         )
-        reserve = max(int(asset.get("totalSize", 0) or 0) + int(asset.get("abSize", 0) or 0), 1024 * 1024)
+        reserve = self.asset_reservation(asset)
         self.memory_budget.acquire(reserve)
         try:
             max_bytes = max(int(asset.get("totalSize", 0) or 0) + 1024 * 1024, 2 * 1024 * 1024)
-            archive = self.download_bytes(f"{base}/{dat_name(name)}", max_bytes)
+            archive = self.client.download_bytes(f"{base}/{dat_name(name)}", max_bytes)
             with zipfile.ZipFile(io.BytesIO(archive)) as source:
                 if name not in source.namelist():
                     raise RuntimeError(f"archive did not contain {name}")
-                exported = self.validate_and_unpack(job, source.read(name), asset)
-        finally:
+                bundle = source.read(name)
+            size = int(asset.get("abSize", 0) or 0)
+            md5 = str(asset.get("md5", ""))
+            if size and len(bundle) != size:
+                raise RuntimeError(f"size mismatch: {name}")
+            if len(md5) == 32 and hashlib.md5(bundle).hexdigest() != md5:
+                raise RuntimeError(f"md5 mismatch: {name}")
+        except Exception:
             self.memory_budget.release(reserve)
+            raise
+        download_ms = round((time.monotonic() - started) * 1000)
         LOGGER.info(
-            "asset_done job=%s worker=%s name=%s exported=%s elapsedMs=%s",
+            "asset_download_done job=%s worker=%s name=%s elapsedMs=%s reservationBytes=%s",
+            job.id,
+            worker,
+            name,
+            download_ms,
+            reserve,
+        )
+        return PreparedAsset(asset, bundle, reserve, started, download_ms)
+
+    def export_one(self, job: Job, prepared: PreparedAsset) -> str:
+        name = prepared.asset["name"]
+        worker = threading.current_thread().name
+        export_started = time.monotonic()
+        LOGGER.info("asset_export_start job=%s worker=%s name=%s", job.id, worker, name)
+        try:
+            exported = self.get_unpacker().unpack(prepared.bundle, name, job.id)
+            self.mark_current(prepared.asset, exported)
+        finally:
+            self.memory_budget.release(prepared.reservation)
+        LOGGER.info(
+            "asset_done job=%s worker=%s name=%s exported=%s downloadMs=%s exportMs=%s elapsedMs=%s",
             job.id,
             worker,
             name,
             exported,
-            round((time.monotonic() - started) * 1000),
+            prepared.download_ms,
+            round((time.monotonic() - export_started) * 1000),
+            round((time.monotonic() - prepared.started) * 1000),
         )
         return name
+
+    def process_assets(self, job: Job, base: str, assets: list[dict[str, Any]]) -> None:
+        remaining = iter(assets)
+        downloads: set[Future[PreparedAsset]] = set()
+        exports: set[Future[str]] = set()
+        ready: deque[PreparedAsset] = deque()
+        exhausted = False
+        first_error: BaseException | None = None
+
+        with ThreadPoolExecutor(
+            max_workers=self.download_workers, thread_name_prefix="ark-download"
+        ) as download_pool, ThreadPoolExecutor(
+            max_workers=self.export_workers, thread_name_prefix="ark-export"
+        ) as export_pool:
+            while downloads or exports or ready or not exhausted:
+                cancelled = job.cancel_requested
+                stop_scheduling = cancelled or first_error is not None
+
+                if stop_scheduling:
+                    while ready:
+                        self.memory_budget.release(ready.popleft().reservation)
+                    for future in downloads:
+                        future.cancel()
+                else:
+                    while ready and len(exports) < self.export_workers:
+                        exports.add(export_pool.submit(self.export_one, job, ready.popleft()))
+
+                    may_prefetch = len(ready) < self.prefetch_bundles
+                    may_feed_export = len(exports) < self.export_workers
+                    while len(downloads) < self.download_workers and (may_prefetch or may_feed_export):
+                        try:
+                            asset = next(remaining)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        downloads.add(download_pool.submit(self.prepare_one, job, base, asset))
+                        may_feed_export = len(exports) + len(downloads) < self.export_workers
+
+                active = downloads | exports
+                if not active:
+                    if stop_scheduling or exhausted:
+                        break
+                    continue
+
+                done, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in done:
+                    if future in downloads:
+                        downloads.remove(future)
+                        if future.cancelled():
+                            continue
+                        try:
+                            prepared = future.result()
+                            if stop_scheduling or job.cancel_requested:
+                                self.memory_budget.release(prepared.reservation)
+                            else:
+                                ready.append(prepared)
+                        except BaseException as error:
+                            if first_error is None:
+                                first_error = error
+                    else:
+                        exports.remove(future)
+                        try:
+                            future.result()
+                            job.completed += 1
+                            if job.completed % 20 == 0:
+                                budget = self.memory_budget.snapshot()
+                                self.update(
+                                    job,
+                                    "downloading_unpacking",
+                                    f"{job.completed}/{job.total}; memory {budget['usedBytes'] // 1048576}/{budget['limitBytes'] // 1048576} MiB",
+                                )
+                        except BaseException as error:
+                            if first_error is None:
+                                first_error = error
+
+            # A running download cannot be cancelled. Its result owns a memory reservation,
+            # so collect and release it before propagating cancellation or the first error.
+            for future in downloads:
+                try:
+                    prepared = future.result()
+                except BaseException:
+                    continue
+                self.memory_budget.release(prepared.reservation)
+
+        if job.cancel_requested:
+            raise InterruptedError("cancel requested")
+        if first_error is not None:
+            raise first_error
 
     def watch(self) -> None:
         failures = 0
@@ -521,7 +680,11 @@ def runtime_config() -> dict[str, Any]:
     return {
         "storagePolicy": "memory-to-unpacked-only",
         "memoryBudgetMB": service.memory_budget_mb,
-        "downloadWorkers": service.workers,
+        "memoryBudget": service.memory_budget.snapshot(),
+        "downloadWorkers": service.download_workers,
+        "exportWorkers": service.export_workers,
+        "prefetchBundles": service.prefetch_bundles,
+        "decodeMemoryFactor": service.decode_memory_factor,
         "containerMemoryLimit": service.container_memory_limit,
         "sharedMemorySize": service.container_shm_size,
         "pollSeconds": service.poll_seconds,

@@ -1,8 +1,9 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from ark_resource_service.app import dat_name, safe_member
+from ark_resource_service.app import Job, MemoryBudget, PreparedAsset, Service, dat_name, safe_member
 
 
 class CoreTests(unittest.TestCase):
@@ -23,7 +24,65 @@ class CoreTests(unittest.TestCase):
             target.write_bytes(b"ark")
             self.assertEqual(target.read_bytes(), b"ark")
 
+    def test_staged_pipeline_releases_memory_and_finishes_every_asset(self):
+        service = Service.__new__(Service)
+        service.download_workers = 2
+        service.export_workers = 2
+        service.prefetch_bundles = 1
+        service.memory_budget = MemoryBudget(8 * 1024 * 1024)
+
+        def prepare(job, base, asset):
+            reservation = 1024 * 1024
+            service.memory_budget.acquire(reservation)
+            return PreparedAsset(asset, b"bundle", reservation, time.monotonic(), 1)
+
+        def export(job, prepared):
+            service.memory_budget.release(prepared.reservation)
+            return prepared.asset["name"]
+
+        service.prepare_one = prepare
+        service.export_one = export
+        assets = [{"name": f"asset-{index}.ab"} for index in range(7)]
+        job = Job(id="pipeline-test", total=len(assets))
+
+        service.process_assets(job, "https://example.invalid", assets)
+
+        self.assertEqual(job.completed, len(assets))
+        self.assertEqual(service.memory_budget.snapshot()["usedBytes"], 0)
+        self.assertLessEqual(service.memory_budget.snapshot()["peakBytes"], 5 * 1024 * 1024)
+
+    def test_staged_pipeline_releases_memory_after_download_failure(self):
+        service = Service.__new__(Service)
+        service.download_workers = 2
+        service.export_workers = 2
+        service.prefetch_bundles = 1
+        service.memory_budget = MemoryBudget(8 * 1024 * 1024)
+
+        def prepare(job, base, asset):
+            reservation = 1024 * 1024
+            service.memory_budget.acquire(reservation)
+            if asset["name"] == "broken.ab":
+                service.memory_budget.release(reservation)
+                raise RuntimeError("download failed")
+            return PreparedAsset(asset, b"bundle", reservation, time.monotonic(), 1)
+
+        def export(job, prepared):
+            service.memory_budget.release(prepared.reservation)
+            return prepared.asset["name"]
+
+        service.prepare_one = prepare
+        service.export_one = export
+        job = Job(id="pipeline-failure-test", total=3)
+
+        with self.assertRaisesRegex(RuntimeError, "download failed"):
+            service.process_assets(
+                job,
+                "https://example.invalid",
+                [{"name": "first.ab"}, {"name": "broken.ab"}, {"name": "last.ab"}],
+            )
+
+        self.assertEqual(service.memory_budget.snapshot()["usedBytes"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
-

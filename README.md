@@ -44,10 +44,12 @@ Spine、Mesh 和 TypeTree；USM 使用其 `cu` 模式。上游 BSD-3-Clause 许�
 `[uc]`、`[ucp]`、`[pack]` 会被移除；同一路径的 Sprite 与 backing Texture2D 只导出
 Sprite。命名卷中的 `State/unpacked_records.json` 记录官方路径、hash、MD5 和导出数量。
 
-内存参数位于项目根目录 `.env`，Compose 和应用共同读取。修改后执行 `docker compose up -d`
-即可重建限制。本机 16 GB、OrbStack VM 8 GB，默认应用在途预算
-768 MB、下载 worker 2、无 Compose 容器内存硬上限、共享内存 768 MB。容器仍受
-OrbStack VM 总内存约束。聚合包引导默认关闭，
+性能和内存参数位于项目根目录 `.env`，Compose 和应用共同读取。修改后执行
+`docker compose up -d` 即可应用。本机 16 GB、OrbStack VM 8 GB，当前使用下载 worker 2、
+Unity 导出 worker 2、预取队列 2、在途预算 768 MB、解码内存估算倍率 6；没有 Compose
+容器内存硬上限，容器仍受 OrbStack VM 总内存约束。下载和 Unity 导出使用两个独立、
+有界的任务阶段：网络连接可复用，下载完成的 bundle 只在内存中等待，预取容量和在途
+预算会共同施加背压。聚合包引导默认关闭，
 每个官方资源 `.dat` 独立下载、内存解包并释放，以避免 Unity 解码时的叠加内存峰值。
 调试用途的 TypeTree JSON 默认关闭；全量 Shader TypeTree 会在单个资源上产生超过 2 GB 的
 内存峰值。图片、文本、音频、Spine 和 Mesh 仍正常导出。
@@ -80,10 +82,13 @@ anonymous binary input is never written to the external disk.
 kept as bytes. Spoken voice audio is separate under `audio/sound_beta_2/voice*/` and
 exports as playable OGG/WAV files when those later manifest entries are processed.
 
-This host uses two download workers without a Compose memory hard limit. The shared
-768 MB `MemoryBudget` gates compressed bytes in flight, while decoded Unity objects
-may use more memory and remain bounded by the OrbStack VM.
+This host uses two download workers and two Unity export workers without a Compose
+memory hard limit. `ARK_PREFETCH_BUNDLES` bounds the ready queue. The shared 768 MB
+`MemoryBudget` accounts for compressed bytes plus `abSize * ARK_DECODE_MEMORY_FACTOR`
+until export finishes; very large bundles therefore run alone instead of multiplying
+their decode peak. Decoded Unity objects remain ultimately bounded by the OrbStack VM.
 The Docker health probe runs once per 60 seconds and marks the service unhealthy only
 after three consecutive failures.
-Container logs emit `asset_start` and `asset_done` records with worker name, official
-resource path, byte sizes, exported file count, and elapsed milliseconds.
+Container logs emit `asset_download_start`, `asset_download_done`, `asset_export_start`,
+and `asset_done` records with stage worker, official resource path, reservation size,
+exported file count, and separate download/export/total milliseconds.
