@@ -1,0 +1,3 @@
+[submodule "vendor/Ark-Unpacker"]
+	path = vendor/Ark-Unpacker
+	url = https://github.com/isHarryh/Ark-Unpacker.git

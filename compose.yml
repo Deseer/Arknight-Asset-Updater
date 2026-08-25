@@ -1,0 +1,27 @@
+services:
+  ark-resource-service:
+    image: local/ark-resource-service:1.0
+    build:
+      context: .
+    container_name: ark-resource-service
+    restart: unless-stopped
+    user: "501:20"
+    environment:
+      ARK_DATA_ROOT: /data
+      ARK_POLL_SECONDS: "5"
+      ARK_DOWNLOAD_WORKERS: "4"
+      ARK_AUTO_UNPACK: "true"
+      ARK_BOOTSTRAP_PACKS: "true"
+      ARK_UNPACKER_ROOT: /opt/ark-unpacker
+      HOME: /tmp
+    volumes:
+      - /Volumes/wd/ArkResourceService:/data
+    ports:
+      - "127.0.0.1:18080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
