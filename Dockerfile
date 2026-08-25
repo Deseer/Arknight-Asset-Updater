@@ -22,7 +22,7 @@ RUN python -m pip install --no-cache-dir -r requirements-service.txt \
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/* /root/.cache
 COPY ark_resource_service/ ./ark_resource_service/
+RUN mkdir -p /state /output && chown -R 501:20 /state /output
 
 EXPOSE 8080
 CMD ["python", "-m", "ark_resource_service"]
-

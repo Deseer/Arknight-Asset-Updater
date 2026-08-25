@@ -35,13 +35,15 @@ Spine、Mesh 和 TypeTree；USM 使用其 `cu` 模式。上游 BSD-3-Clause 许�
 
 ## 数据目录
 
-容器把 `/Volumes/wd/ArkResourceService` 挂载到 `/data`。WD 只长期保留 `Unpacked`、
-`State` 和 `Logs`；`Bundles`、`Downloads`、`Queue` 仅用于旧版本数据迁移，迁移完成后为空。
+容器把 `/Volumes/wd/ArkResourceService` 作为纯结果目录挂载到 `/output`。外置盘目录根部
+直接是官方资源分类，如 `arts`、`audio`、`battle`、`chararts`，不再创建 `Unpacked`、
+`Bundles`、`Downloads`、`State` 或 `Logs`。状态和日志保存在 Docker 命名卷
+`ark-resource-state`。
 
-导出结构固定为 `Unpacked/resources/<官方清单资源路径去掉扩展名>/...`，例如
-`battle/enm_pfb_24.ab` 对应 `Unpacked/resources/battle/enm_pfb_24/`。每个资源先写入
-`.staging`，全部成功后整目录原子替换，避免新版与旧版文件混杂。`State/unpacked_records.json`
-记录官方路径、hash、MD5、输出目录和导出数量。
+导出结构固定为 `<官方清单资源路径去掉扩展名>/...`，例如 `battle/enm_pfb_24.ab`
+对应 `/Volumes/wd/ArkResourceService/battle/enm_pfb_24/`。每个资源在同分类目录内使用
+隐藏 staging，全部成功后整目录原子替换，避免新版与旧版文件混杂。命名卷中的
+`State/unpacked_records.json` 记录官方路径、hash、MD5、输出目录和导出数量。
 
 内存参数位于项目根目录 `.env`，Compose 和应用共同读取。修改后执行 `docker compose up -d`
 即可重建限制。本机 16 GB、OrbStack VM 8 GB，默认应用在途预算

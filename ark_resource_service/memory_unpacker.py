@@ -41,10 +41,11 @@ class MemoryUnpacker:
         return self.output_root.joinpath(*relative.with_suffix("").parts)
 
     def relative_destination(self, asset_name: str) -> str:
-        return self._destination(asset_name).relative_to(self.output_root.parent).as_posix()
+        return self._destination(asset_name).relative_to(self.output_root).as_posix()
 
-    def _staging_directory(self) -> Path:
-        staging = self.output_root.parent / ".staging" / uuid.uuid4().hex
+    def _staging_directory(self, destination: Path) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = destination.parent / f".ark-staging-{destination.name}-{uuid.uuid4().hex}"
         staging.mkdir(parents=True, exist_ok=False)
         return staging
 
@@ -75,7 +76,7 @@ class MemoryUnpacker:
 
     def unpack_ab(self, data: bytes, asset_name: str) -> int:
         destination = self._destination(asset_name)
-        staging = self._staging_directory()
+        staging = self._staging_directory(destination)
         resource = self.Resource(self.UnityPy.load(BytesIO(data)))
         exported = 0
 
@@ -128,7 +129,7 @@ class MemoryUnpacker:
         source = memory_root / PurePosixPath(asset_name).name
         source.write_bytes(data)
         destination = self._destination(asset_name)
-        staging = self._staging_directory()
+        staging = self._staging_directory(destination)
         log = self.log_root / f"{job_id}-usm.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         command = [

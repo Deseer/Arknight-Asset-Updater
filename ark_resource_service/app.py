@@ -153,7 +153,9 @@ class OfficialClient:
 
 class Service:
     def __init__(self) -> None:
-        self.root = Path(os.getenv("ARK_DATA_ROOT", "/data"))
+        self.root = Path(os.getenv("ARK_STATE_ROOT", "/state"))
+        self.output_root = Path(os.getenv("ARK_OUTPUT_ROOT", "/output"))
+        self.legacy_root = Path(os.getenv("ARK_LEGACY_ROOT", "/nonexistent-legacy-root"))
         config = load_json(Path(os.getenv("ARK_CONFIG", "/app/config/service.json")), {})
         self.poll_seconds = max(2.0, float(os.getenv("ARK_POLL_SECONDS", config.get("pollSeconds", 5))))
         self.workers = max(1, min(2, int(os.getenv("ARK_DOWNLOAD_WORKERS", config.get("downloadWorkers", 2)))))
@@ -178,14 +180,17 @@ class Service:
         except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError):
             pass
         for asset_name, record in self.records.items():
-            record.setdefault("outputDir", f"resources/{PurePosixPath(asset_name).with_suffix('').as_posix()}")
+            record.setdefault("outputDir", PurePosixPath(asset_name).with_suffix("").as_posix())
         self.stop = threading.Event()
         self.watcher: threading.Thread | None = None
         self.sync_failures = 0
         self.next_sync_attempt = 0.0
-        for name in ("Bundles", "Downloads", "Queue", "State", "Unpacked", "Logs"):
+        for name in ("State", "Logs"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
-        shutil.rmtree(self.root / "Unpacked" / ".staging", ignore_errors=True)
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        for stale in self.output_root.rglob(".ark-staging-*"):
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
 
     def save_job(self, job: Job) -> None:
         job.updated_at = utc_now()
@@ -301,7 +306,7 @@ class Service:
 
             self.memory_unpacker = MemoryUnpacker(
                 self.unpacker_root,
-                self.root / "Unpacked" / "resources",
+                self.output_root,
                 self.root / "Logs",
             )
         return self.memory_unpacker
@@ -347,7 +352,9 @@ class Service:
         return processed
 
     def drain_legacy_bundles(self, job: Job, allowed: dict[str, dict[str, Any]]) -> None:
-        bundle_root = self.root / "Bundles"
+        bundle_root = self.legacy_root
+        if not bundle_root.is_dir():
+            return
         legacy = [p for p in bundle_root.rglob("*") if p.is_file() and p.relative_to(bundle_root).as_posix() in allowed]
         if not legacy:
             return
