@@ -74,4 +74,8 @@ backing Texture2D, only the Sprite is exported, avoiding the old `$0` duplicate.
 
 Recognized anonymous game tables are decoded directly to `masterdata/*.json`; the
 anonymous binary input is never written to the external disk.
+
+`lipsync/voice*/*.bytes` contains small lip-animation timing data and is intentionally
+kept as bytes. Spoken voice audio is separate under `audio/sound_beta_2/voice*/` and
+exports as playable OGG/WAV files when those later manifest entries are processed.
 ```
