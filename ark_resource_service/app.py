@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import random
 import shutil
-import subprocess
 import threading
 import time
 import uuid
@@ -76,6 +76,25 @@ class UpdateRequest(BaseModel):
     dry_run: bool = False
 
 
+class MemoryBudget:
+    def __init__(self, limit_bytes: int):
+        self.limit = limit_bytes
+        self.used = 0
+        self.condition = threading.Condition()
+
+    def acquire(self, requested: int) -> None:
+        requested = max(1, requested)
+        with self.condition:
+            while self.used and self.used + requested > self.limit:
+                self.condition.wait()
+            self.used += requested
+
+    def release(self, requested: int) -> None:
+        with self.condition:
+            self.used = max(0, self.used - max(1, requested))
+            self.condition.notify_all()
+
+
 class OfficialClient:
     def __init__(self, root: Path):
         self.root = root
@@ -135,21 +154,38 @@ class OfficialClient:
 class Service:
     def __init__(self) -> None:
         self.root = Path(os.getenv("ARK_DATA_ROOT", "/data"))
-        self.poll_seconds = max(2.0, float(os.getenv("ARK_POLL_SECONDS", "5")))
-        self.workers = max(1, int(os.getenv("ARK_DOWNLOAD_WORKERS", "4")))
-        self.auto_unpack = os.getenv("ARK_AUTO_UNPACK", "true").lower() == "true"
-        self.bootstrap_packs = os.getenv("ARK_BOOTSTRAP_PACKS", "true").lower() == "true"
+        config = load_json(Path(os.getenv("ARK_CONFIG", "/app/config/service.json")), {})
+        self.poll_seconds = max(2.0, float(os.getenv("ARK_POLL_SECONDS", config.get("pollSeconds", 5))))
+        self.workers = max(1, min(2, int(os.getenv("ARK_DOWNLOAD_WORKERS", config.get("downloadWorkers", 2)))))
+        self.bootstrap_packs = os.getenv("ARK_BOOTSTRAP_PACKS", str(config.get("bootstrapPacks", True))).lower() == "true"
+        self.memory_budget_mb = max(512, int(os.getenv("ARK_MEMORY_BUDGET_MB", config.get("memoryBudgetMB", 768))))
+        self.container_memory_limit = os.getenv("ARK_CONTAINER_MEMORY_LIMIT", "2g")
+        self.container_shm_size = os.getenv("ARK_CONTAINER_SHM_SIZE", "768m")
+        self.memory_budget = MemoryBudget(self.memory_budget_mb * 1024 * 1024)
         self.unpacker_root = Path(os.getenv("ARK_UNPACKER_ROOT", "/opt/ark-unpacker"))
+        self.memory_unpacker = None
         self.client = OfficialClient(self.root)
         self.jobs: dict[str, Job] = {}
         self.active_job: str | None = None
         self.lock = threading.Lock()
+        self.records_lock = threading.Lock()
+        self.records: dict[str, dict[str, Any]] = load_json(self.root / "State" / "unpacked_records.json", {})
+        self.records_journal = self.root / "State" / "unpacked_records.jsonl"
+        try:
+            for line in self.records_journal.read_text(encoding="utf-8").splitlines():
+                entry = json.loads(line)
+                self.records[entry["name"]] = entry["record"]
+        except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError):
+            pass
+        for asset_name, record in self.records.items():
+            record.setdefault("outputDir", f"resources/{PurePosixPath(asset_name).with_suffix('').as_posix()}")
         self.stop = threading.Event()
         self.watcher: threading.Thread | None = None
         self.sync_failures = 0
         self.next_sync_attempt = 0.0
         for name in ("Bundles", "Downloads", "Queue", "State", "Unpacked", "Logs"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(self.root / "Unpacked" / ".staging", ignore_errors=True)
 
     def save_job(self, job: Job) -> None:
         job.updated_at = utc_now()
@@ -185,43 +221,33 @@ class Service:
             assets = manifest.get("abInfos", [])
             allowed = {asset["name"]: asset for asset in assets}
             old_manifest = load_json(self.root / "State" / "hot_update_list.json", {})
-            old_assets = {asset["name"]: asset for asset in old_manifest.get("abInfos", [])}
-            missing = [a for a in assets if not self.is_current(a, old_assets.get(a["name"]))]
+            self.drain_legacy_bundles(job, allowed)
+            missing = [a for a in assets if not self.is_current(a)]
             job.total = len(missing)
             self.update(job, "planning", f"{len(missing)}/{len(assets)} resources need synchronization")
             if job.dry_run:
                 job.status, job.phase = "completed", "completed"
                 self.save_job(job)
                 return
-            queue = self.root / "Queue" / job.id
-            if not old_manifest:
-                # A legacy/bootstrap deployment may already have verified bundle files but
-                # no completed manifest yet. Queue them once so they are not skipped by the
-                # unpack phase when pack download resumes.
-                for asset in assets:
-                    if self.is_current(asset, None):
-                        self.link_queue(queue, asset["name"])
             if self.bootstrap_packs and not old_manifest and missing:
-                self.process_packs(job, base_url, manifest, allowed, queue)
-            missing = [a for a in assets if not self.is_current(a, old_assets.get(a["name"]))]
+                self.process_packs(job, base_url, manifest, allowed)
+            missing = [a for a in assets if not self.is_current(a)]
             job.total = len(missing)
-            self.update(job, "downloading", f"downloading {len(missing)} individual resources")
+            self.update(job, "downloading_unpacking", f"streaming and unpacking {len(missing)} resources")
             if missing:
                 with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                    futures = {pool.submit(self.download_one, base_url, a, allowed): a for a in missing}
+                    futures = {pool.submit(self.download_one, job, base_url, a): a for a in missing}
                     for future in as_completed(futures):
                         if job.cancel_requested:
                             for pending in futures:
                                 pending.cancel()
                             raise InterruptedError("cancel requested")
-                        name = future.result()
-                        self.link_queue(queue, name)
+                        future.result()
                         job.completed += 1
                         if job.completed % 20 == 0:
-                            self.update(job, "downloading", f"{job.completed}/{job.total}")
+                            self.update(job, "downloading_unpacking", f"{job.completed}/{job.total}")
             atomic_json(self.root / "State" / "hot_update_list.json", manifest)
-            if self.auto_unpack and queue.exists() and any(p.is_file() for p in queue.rglob("*")):
-                self.unpack(job, queue)
+            self.compact_records()
             job.status, job.phase, job.detail = "completed", "completed", "synchronized and unpacked"
             self.sync_failures = 0
             self.next_sync_attempt = 0.0
@@ -240,69 +266,107 @@ class Service:
                 if self.active_job == job.id:
                     self.active_job = None
 
-    def is_current(self, asset: dict[str, Any], old: dict[str, Any] | None) -> bool:
-        path = self.root / "Bundles" / PurePosixPath(asset["name"])
-        if not path.is_file():
-            return False
-        size = int(asset.get("abSize", 0) or 0)
-        if size and path.stat().st_size != size:
-            return False
-        return old is None or (old.get("hash") == asset.get("hash") and old.get("md5") == asset.get("md5"))
+    @property
+    def records_path(self) -> Path:
+        return self.root / "State" / "unpacked_records.json"
+
+    def is_current(self, asset: dict[str, Any]) -> bool:
+        with self.records_lock:
+            record = self.records.get(asset["name"])
+        return bool(record and record.get("hash") == asset.get("hash") and record.get("md5") == asset.get("md5"))
+
+    def mark_current(self, asset: dict[str, Any], exported: int) -> None:
+        with self.records_lock:
+            record = {
+                "hash": asset.get("hash", ""),
+                "md5": asset.get("md5", ""),
+                "size": int(asset.get("abSize", 0) or 0),
+                "exported": exported,
+                "outputDir": self.get_unpacker().relative_destination(asset["name"]),
+                "unpackedAt": utc_now(),
+            }
+            self.records[asset["name"]] = record
+            self.records_journal.parent.mkdir(parents=True, exist_ok=True)
+            with self.records_journal.open("a", encoding="utf-8") as journal:
+                journal.write(json.dumps({"name": asset["name"], "record": record}, ensure_ascii=False) + "\n")
+
+    def compact_records(self) -> None:
+        with self.records_lock:
+            atomic_json(self.records_path, self.records)
+            self.records_journal.unlink(missing_ok=True)
+
+    def get_unpacker(self):
+        if self.memory_unpacker is None:
+            from .memory_unpacker import MemoryUnpacker
+
+            self.memory_unpacker = MemoryUnpacker(
+                self.unpacker_root,
+                self.root / "Unpacked" / "resources",
+                self.root / "Logs",
+            )
+        return self.memory_unpacker
 
     @staticmethod
-    def download(url: str, destination: Path, retried: bool = False) -> None:
+    def download_bytes(url: str, max_bytes: int) -> bytes:
         session = requests.Session()
         session.headers["User-Agent"] = USER_AGENT
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        existing = destination.stat().st_size if destination.exists() else 0
-        headers = {"Range": f"bytes={existing}-"} if existing else {}
-        with session.get(url, headers=headers, stream=True, timeout=(30, 180)) as response:
-            if response.status_code == 416 and destination.is_file():
-                # A previous process may have finished the transfer but died before
-                # extraction/rename. Official resources are ZIP .dat files, so a valid
-                # central directory is sufficient to continue without downloading again.
-                if zipfile.is_zipfile(destination):
-                    return
-                if retried:
-                    response.raise_for_status()
-                destination.unlink(missing_ok=True)
-                return Service.download(url, destination, retried=True)
-            mode = "ab" if existing and response.status_code == 206 else "wb"
+        output = io.BytesIO()
+        with session.get(url, stream=True, timeout=(30, 180)) as response:
             response.raise_for_status()
-            with destination.open(mode) as output:
-                for chunk in response.iter_content(1024 * 1024):
-                    if chunk:
-                        output.write(chunk)
+            declared = int(response.headers.get("Content-Length", "0") or 0)
+            if declared and declared > max_bytes:
+                raise RuntimeError(f"response exceeds configured memory allowance: {declared} > {max_bytes}")
+            for chunk in response.iter_content(1024 * 1024):
+                if chunk:
+                    output.write(chunk)
+                    if output.tell() > max_bytes:
+                        raise RuntimeError(f"stream exceeds configured memory allowance: {output.tell()} > {max_bytes}")
+        return output.getvalue()
 
-    def extract(self, archive: Path, allowed: dict[str, dict[str, Any]]) -> list[str]:
-        result: list[str] = []
-        with zipfile.ZipFile(archive) as source:
+    def validate_and_unpack(self, job: Job, data: bytes, asset: dict[str, Any]) -> int:
+        size = int(asset.get("abSize", 0) or 0)
+        md5 = str(asset.get("md5", ""))
+        if size and len(data) != size:
+            raise RuntimeError(f"size mismatch: {asset['name']}")
+        if len(md5) == 32 and hashlib.md5(data).hexdigest() != md5:
+            raise RuntimeError(f"md5 mismatch: {asset['name']}")
+        exported = self.get_unpacker().unpack(data, asset["name"], job.id)
+        self.mark_current(asset, exported)
+        return exported
+
+    def process_archive_bytes(self, job: Job, archive: bytes, allowed: dict[str, dict[str, Any]]) -> int:
+        processed = 0
+        with zipfile.ZipFile(io.BytesIO(archive)) as source:
             for info in source.infolist():
-                if info.is_dir() or info.filename not in allowed:
+                if info.is_dir() or info.filename not in allowed or self.is_current(allowed[info.filename]):
                     continue
                 member = safe_member(info.filename)
                 asset = allowed[member.as_posix()]
-                target = self.root / "Bundles" / member
-                target.parent.mkdir(parents=True, exist_ok=True)
-                temporary = target.with_suffix(target.suffix + ".partial")
-                digest = hashlib.md5()
-                with source.open(info) as reader, temporary.open("wb") as writer:
-                    while chunk := reader.read(1024 * 1024):
-                        digest.update(chunk)
-                        writer.write(chunk)
-                size = int(asset.get("abSize", 0) or 0)
-                md5 = str(asset.get("md5", ""))
-                if size and temporary.stat().st_size != size:
-                    temporary.unlink(missing_ok=True)
-                    raise RuntimeError(f"size mismatch: {member}")
-                if len(md5) == 32 and digest.hexdigest() != md5:
-                    temporary.unlink(missing_ok=True)
-                    raise RuntimeError(f"md5 mismatch: {member}")
-                os.replace(temporary, target)
-                result.append(member.as_posix())
-        return result
+                self.validate_and_unpack(job, source.read(info), asset)
+                processed += 1
+        return processed
 
-    def process_packs(self, job: Job, base: str, manifest: dict[str, Any], allowed: dict[str, Any], queue: Path) -> None:
+    def drain_legacy_bundles(self, job: Job, allowed: dict[str, dict[str, Any]]) -> None:
+        bundle_root = self.root / "Bundles"
+        legacy = [p for p in bundle_root.rglob("*") if p.is_file() and p.relative_to(bundle_root).as_posix() in allowed]
+        if not legacy:
+            return
+        for index, path in enumerate(legacy, 1):
+            if job.cancel_requested:
+                raise InterruptedError("cancel requested")
+            name = path.relative_to(bundle_root).as_posix()
+            asset = allowed[name]
+            self.update(job, "migrating_legacy", f"memory unpack {index}/{len(legacy)}: {name}")
+            if not self.is_current(asset):
+                reserve = max(path.stat().st_size * 2, 1024 * 1024)
+                self.memory_budget.acquire(reserve)
+                try:
+                    self.validate_and_unpack(job, path.read_bytes(), asset)
+                finally:
+                    self.memory_budget.release(reserve)
+            path.unlink()
+
+    def process_packs(self, job: Job, base: str, manifest: dict[str, Any], allowed: dict[str, Any]) -> None:
         state_path = self.root / "State" / "packs.json"
         state = load_json(state_path, {})
         version = manifest["versionId"]
@@ -314,52 +378,33 @@ class Service:
             name = pack["name"]
             if name in completed:
                 continue
-            self.update(job, "bootstrap_packs", f"pack {index}/{len(packs)}: {name}")
-            archive = self.root / "Downloads" / f"{name}.dat.part"
-            self.download(f"{base}/{name}.dat", archive)
-            for extracted in self.extract(archive, allowed):
-                self.link_queue(queue, extracted)
-            archive.unlink(missing_ok=True)
+            self.update(job, "memory_download_unpack", f"pack {index}/{len(packs)}: {name}")
+            reserve = max(int(pack.get("totalSize", 0) or 0) * 2, 1024 * 1024)
+            self.memory_budget.acquire(reserve)
+            try:
+                max_bytes = max(int(pack.get("totalSize", 0) or 0) + 1024 * 1024, 2 * 1024 * 1024)
+                archive = self.download_bytes(f"{base}/{name}.dat", max_bytes)
+                self.process_archive_bytes(job, archive, allowed)
+            finally:
+                self.memory_budget.release(reserve)
             completed.add(name)
+            self.compact_records()
             atomic_json(state_path, {"version": version, "completed": sorted(completed)})
 
-    def download_one(self, base: str, asset: dict[str, Any], allowed: dict[str, Any]) -> str:
+    def download_one(self, job: Job, base: str, asset: dict[str, Any]) -> str:
         name = asset["name"]
-        archive = self.root / "Downloads" / f"{dat_name(name)}.part"
-        self.download(f"{base}/{dat_name(name)}", archive)
-        extracted = self.extract(archive, allowed)
-        archive.unlink(missing_ok=True)
-        if name not in extracted:
-            raise RuntimeError(f"archive did not contain {name}")
-        return name
-
-    def link_queue(self, queue: Path, name: str) -> None:
-        if not name.endswith((".ab", ".bin", ".usm")):
-            return
-        source = self.root / "Bundles" / PurePosixPath(name)
-        target = queue / PurePosixPath(name)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.unlink(missing_ok=True)
+        reserve = max(int(asset.get("totalSize", 0) or 0) + int(asset.get("abSize", 0) or 0), 1024 * 1024)
+        self.memory_budget.acquire(reserve)
         try:
-            os.link(source, target)
-        except OSError:
-            shutil.copy2(source, target)
-
-    def unpack(self, job: Job, queue: Path) -> None:
-        self.update(job, "unpacking", "running pinned Ark-Unpacker backend")
-        log = self.root / "Logs" / f"{job.id}.log"
-        base = ["python", str(self.unpacker_root / "Main.py"), "--input", str(queue), "--output", str(self.root / "Unpacked"), "--logging-level", "3"]
-        commands: list[list[str]] = []
-        if any(queue.rglob("*.ab")) or any(queue.rglob("*.bin")):
-            commands.append(base + ["--mode", "ab", "--image", "--text", "--audio", "--spine", "--mesh", "--typetree", "--group"])
-        if any(queue.rglob("*.usm")):
-            commands.append(base + ["--mode", "cu"])
-        with log.open("a", encoding="utf-8") as output:
-            for command in commands:
-                result = subprocess.run(command, cwd=self.unpacker_root, stdout=output, stderr=subprocess.STDOUT)
-                if result.returncode:
-                    raise RuntimeError(f"Ark-Unpacker exited {result.returncode}; see {log}")
-        shutil.rmtree(queue)
+            max_bytes = max(int(asset.get("totalSize", 0) or 0) + 1024 * 1024, 2 * 1024 * 1024)
+            archive = self.download_bytes(f"{base}/{dat_name(name)}", max_bytes)
+            with zipfile.ZipFile(io.BytesIO(archive)) as source:
+                if name not in source.namelist():
+                    raise RuntimeError(f"archive did not contain {name}")
+                self.validate_and_unpack(job, source.read(name), asset)
+        finally:
+            self.memory_budget.release(reserve)
+        return name
 
     def watch(self) -> None:
         failures = 0
@@ -413,6 +458,18 @@ def health() -> dict[str, Any]:
 @app.get("/v1/version")
 def version() -> dict[str, Any]:
     return {"official": service.client.version, "etag": service.client.etag, "lastModified": service.client.last_modified, "lastCheckedAt": service.client.last_checked_at, "pollSeconds": service.poll_seconds, "versionUrl": service.client.version_url}
+
+
+@app.get("/v1/config")
+def runtime_config() -> dict[str, Any]:
+    return {
+        "storagePolicy": "memory-to-unpacked-only",
+        "memoryBudgetMB": service.memory_budget_mb,
+        "downloadWorkers": service.workers,
+        "containerMemoryLimit": service.container_memory_limit,
+        "sharedMemorySize": service.container_shm_size,
+        "pollSeconds": service.poll_seconds,
+    }
 
 
 @app.post("/v1/assets/update", status_code=202)

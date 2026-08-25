@@ -8,14 +8,19 @@ services:
     user: "501:20"
     environment:
       ARK_DATA_ROOT: /data
-      ARK_POLL_SECONDS: "5"
-      ARK_DOWNLOAD_WORKERS: "4"
-      ARK_AUTO_UNPACK: "true"
-      ARK_BOOTSTRAP_PACKS: "true"
+      ARK_POLL_SECONDS: "${ARK_POLL_SECONDS:-5}"
+      ARK_DOWNLOAD_WORKERS: "${ARK_DOWNLOAD_WORKERS:-2}"
+      ARK_MEMORY_BUDGET_MB: "${ARK_MEMORY_BUDGET_MB:-768}"
+      ARK_CONTAINER_MEMORY_LIMIT: "${ARK_CONTAINER_MEMORY_LIMIT:-2g}"
+      ARK_CONTAINER_SHM_SIZE: "${ARK_CONTAINER_SHM_SIZE:-768m}"
+      ARK_BOOTSTRAP_PACKS: "${ARK_BOOTSTRAP_PACKS:-true}"
       ARK_UNPACKER_ROOT: /opt/ark-unpacker
       HOME: /tmp
     volumes:
       - /Volumes/wd/ArkResourceService:/data
+    mem_limit: "${ARK_CONTAINER_MEMORY_LIMIT:-2g}"
+    memswap_limit: "${ARK_CONTAINER_MEMORY_LIMIT:-2g}"
+    shm_size: "${ARK_CONTAINER_SHM_SIZE:-768m}"
     ports:
       - "127.0.0.1:18080:8080"
     healthcheck:
@@ -24,4 +29,3 @@ services:
       timeout: 5s
       retries: 4
       start_period: 30s
-
