@@ -23,6 +23,7 @@ from pydantic import BaseModel
 CONFIG_URL = "https://ak-conf.hypergryph.com/config/prod/official/network_config"
 PLATFORM = "Android"
 USER_AGENT = "ArkResourceService/1.0"
+EXPORT_LAYOUT_VERSION = "semantic-container-v1"
 
 
 def utc_now() -> str:
@@ -160,6 +161,19 @@ class Service:
         self.poll_seconds = max(2.0, float(os.getenv("ARK_POLL_SECONDS", config.get("pollSeconds", 5))))
         self.workers = max(1, min(2, int(os.getenv("ARK_DOWNLOAD_WORKERS", config.get("downloadWorkers", 2)))))
         self.bootstrap_packs = os.getenv("ARK_BOOTSTRAP_PACKS", str(config.get("bootstrapPacks", True))).lower() == "true"
+        from .memory_unpacker import parse_export_types
+
+        self.export_types = parse_export_types(
+            os.getenv("ARK_EXPORT_TYPES", "image,spine,text,audio,mesh,video,masterdata")
+        )
+        self.typetree_types = frozenset(
+            item.strip()
+            for item in os.getenv(
+                "ARK_TYPETREE_TYPES",
+                "MonoBehaviour,Material,AnimatorController,AnimationClip,AssetBundle,GameObject,Transform,RectTransform,ParticleSystem,ParticleSystemRenderer,MeshRenderer,SkinnedMeshRenderer,SpriteRenderer,MonoScript",
+            ).split(",")
+            if item.strip()
+        )
         self.memory_budget_mb = max(512, int(os.getenv("ARK_MEMORY_BUDGET_MB", config.get("memoryBudgetMB", 768))))
         self.container_memory_limit = os.getenv("ARK_CONTAINER_MEMORY_LIMIT", "2g")
         self.container_shm_size = os.getenv("ARK_CONTAINER_SHM_SIZE", "768m")
@@ -278,7 +292,18 @@ class Service:
     def is_current(self, asset: dict[str, Any]) -> bool:
         with self.records_lock:
             record = self.records.get(asset["name"])
-        return bool(record and record.get("hash") == asset.get("hash") and record.get("md5") == asset.get("md5"))
+        return bool(
+            record
+            and record.get("hash") == asset.get("hash")
+            and record.get("md5") == asset.get("md5")
+            and record.get("exportProfile") == self.export_profile
+        )
+
+    @property
+    def export_profile(self) -> str:
+        types = ",".join(sorted(self.export_types))
+        trees = ",".join(sorted(value.lower() for value in self.typetree_types))
+        return f"{EXPORT_LAYOUT_VERSION}:{types}:{trees}"
 
     def mark_current(self, asset: dict[str, Any], exported: int) -> None:
         with self.records_lock:
@@ -287,6 +312,7 @@ class Service:
                 "md5": asset.get("md5", ""),
                 "size": int(asset.get("abSize", 0) or 0),
                 "exported": exported,
+                "exportProfile": self.export_profile,
                 "outputDir": self.get_unpacker().relative_destination(asset["name"]),
                 "unpackedAt": utc_now(),
             }
@@ -308,6 +334,8 @@ class Service:
                 self.unpacker_root,
                 self.output_root,
                 self.root / "Logs",
+                self.export_types,
+                self.typetree_types,
             )
         return self.memory_unpacker
 
@@ -476,6 +504,9 @@ def runtime_config() -> dict[str, Any]:
         "containerMemoryLimit": service.container_memory_limit,
         "sharedMemorySize": service.container_shm_size,
         "pollSeconds": service.poll_seconds,
+        "exportTypes": sorted(service.export_types),
+        "typeTreeTypes": sorted(service.typetree_types),
+        "exportLayout": EXPORT_LAYOUT_VERSION,
     }
 
 

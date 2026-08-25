@@ -47,9 +47,31 @@ Spine、Mesh 和 TypeTree；USM 使用其 `cu` 模式。上游 BSD-3-Clause 许�
 
 内存参数位于项目根目录 `.env`，Compose 和应用共同读取。修改后执行 `docker compose up -d`
 即可重建限制。本机 16 GB、OrbStack VM 8 GB，默认应用在途预算
-768 MB、下载并发 2、容器硬上限 2 GB、共享内存 768 MB。
+768 MB、下载并发 1、容器硬上限 2 GB、共享内存 768 MB。聚合包引导默认关闭，
+每个官方资源 `.dat` 独立下载、内存解包并释放，以避免 Unity 解码时的叠加内存峰值。
+调试用途的 TypeTree JSON 默认关闭；全量 Shader TypeTree 会在单个资源上产生超过 2 GB 的
+内存峰值。图片、文本、音频、Spine 和 Mesh 仍正常导出。
 
 ```bash
 docker compose up -d --build
 curl http://127.0.0.1:18080/healthz
+
+### Export types and output layout
+
+`ARK_EXPORT_TYPES` is a comma-separated whitelist. Supported values are `image`,
+`spine`, `text`, `audio`, `mesh`, `video`, `masterdata`, and `typetree`. The local
+deployment currently enables every directly usable file export, while TypeTree stays
+opt-in. Enabling it writes selected classes one-by-one below `metadata/`, controlled
+by `ARK_TYPETREE_TYPES`. Shader TypeTrees remain excluded because a single Shader
+tree can exceed the 2 GB container limit.
+
+Unity objects are written using their internal container path instead of the CDN
+bundle name. Leading `dyn/` and upstream build markers such as `[uc]`, `[ucp]`, and
+`[pack]` are removed from the user-facing path. Shards such as
+`spritepack/ui_char_avatar_0.ab` and `_17.ab` therefore merge into the semantic
+`arts/charavatars/` directory. When the same path contains both a Sprite and its
+backing Texture2D, only the Sprite is exported, avoiding the old `$0` duplicate.
+
+Recognized anonymous game tables are decoded directly to `masterdata/*.json`; the
+anonymous binary input is never written to the external disk.
 ```
