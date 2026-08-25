@@ -71,6 +71,7 @@ class Job:
     total: int = 0
     completed: int = 0
     failed: int = 0
+    skipped: int = 0
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     cancel_requested: bool = False
@@ -320,7 +321,12 @@ class Service:
                 self.process_assets(job, base_url, missing)
             atomic_json(self.root / "State" / "hot_update_list.json", manifest)
             self.compact_records()
-            job.status, job.phase, job.detail = "completed", "completed", "synchronized and unpacked"
+            job.status = "completed"
+            if job.skipped:
+                job.phase = "completed_with_skips"
+                job.detail = f"synchronized and unpacked; skipped {job.skipped} resource(s)"
+            else:
+                job.phase, job.detail = "completed", "synchronized and unpacked"
             self.sync_failures = 0
             self.next_sync_attempt = 0.0
             self.save_job(job)
@@ -379,6 +385,21 @@ class Service:
         with self.records_lock:
             atomic_json(self.records_path, self.records)
             self.records_journal.unlink(missing_ok=True)
+
+    def mark_skipped(self, job: Job, asset: dict[str, Any], error: BaseException) -> None:
+        entry = {
+            "jobId": job.id,
+            "name": asset["name"],
+            "hash": asset.get("hash", ""),
+            "md5": asset.get("md5", ""),
+            "error": f"{type(error).__name__}: {error}"[:2000],
+            "skippedAt": utc_now(),
+        }
+        path = self.root / "State" / "skipped_assets.jsonl"
+        with self.records_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def get_unpacker(self):
         if self.memory_unpacker is None:
@@ -536,7 +557,7 @@ class Service:
     def process_assets(self, job: Job, base: str, assets: list[dict[str, Any]]) -> None:
         remaining = iter(assets)
         downloads: set[Future[PreparedAsset]] = set()
-        exports: set[Future[str]] = set()
+        exports: dict[Future[str], dict[str, Any]] = {}
         ready: deque[PreparedAsset] = deque()
         exhausted = False
         first_error: BaseException | None = None
@@ -557,7 +578,9 @@ class Service:
                         future.cancel()
                 else:
                     while ready and len(exports) < self.export_workers:
-                        exports.add(export_pool.submit(self.export_one, job, ready.popleft()))
+                        prepared = ready.popleft()
+                        future = export_pool.submit(self.export_one, job, prepared)
+                        exports[future] = prepared.asset
 
                     may_prefetch = len(ready) < self.prefetch_bundles
                     may_feed_export = len(exports) < self.export_workers
@@ -570,7 +593,7 @@ class Service:
                         downloads.add(download_pool.submit(self.prepare_one, job, base, asset))
                         may_feed_export = len(exports) + len(downloads) < self.export_workers
 
-                active = downloads | exports
+                active = downloads | set(exports)
                 if not active:
                     if stop_scheduling or exhausted:
                         break
@@ -592,20 +615,29 @@ class Service:
                             if first_error is None:
                                 first_error = error
                     else:
-                        exports.remove(future)
+                        asset = exports.pop(future)
                         try:
                             future.result()
                             job.completed += 1
-                            if job.completed % 20 == 0:
+                            processed = job.completed + job.skipped
+                            if processed % 20 == 0:
                                 budget = self.memory_budget.snapshot()
                                 self.update(
                                     job,
                                     "downloading_unpacking",
-                                    f"{job.completed}/{job.total}; memory {budget['usedBytes'] // 1048576}/{budget['limitBytes'] // 1048576} MiB",
+                                    f"{processed}/{job.total}; skipped {job.skipped}; memory {budget['usedBytes'] // 1048576}/{budget['limitBytes'] // 1048576} MiB",
                                 )
                         except BaseException as error:
-                            if first_error is None:
-                                first_error = error
+                            job.failed += 1
+                            job.skipped += 1
+                            self.mark_skipped(job, asset, error)
+                            LOGGER.error(
+                                "asset_skipped job=%s name=%s error=%s: %s",
+                                job.id,
+                                asset["name"],
+                                type(error).__name__,
+                                error,
+                            )
 
             # A running download cannot be cancelled. Its result owns a memory reservation,
             # so collect and release it before propagating cancellation or the first error.

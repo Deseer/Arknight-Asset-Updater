@@ -92,3 +92,6 @@ after three consecutive failures.
 Container logs emit `asset_download_start`, `asset_download_done`, `asset_export_start`,
 and `asset_done` records with stage worker, official resource path, reservation size,
 exported file count, and separate download/export/total milliseconds.
+UnityPy false-positive GZIP probes fall back to ordinary resource nodes. If an individual
+validated bundle still cannot be exported, the service records it in the state volume's
+`State/skipped_assets.jsonl`, emits `asset_skipped`, and continues the remaining manifest.

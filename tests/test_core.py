@@ -83,6 +83,39 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(service.memory_budget.snapshot()["usedBytes"], 0)
 
+    def test_staged_pipeline_skips_export_failure_and_continues(self):
+        service = Service.__new__(Service)
+        service.download_workers = 2
+        service.export_workers = 2
+        service.prefetch_bundles = 1
+        service.memory_budget = MemoryBudget(8 * 1024 * 1024)
+        skipped = []
+
+        def prepare(job, base, asset):
+            reservation = 1024 * 1024
+            service.memory_budget.acquire(reservation)
+            return PreparedAsset(asset, b"bundle", reservation, time.monotonic(), 1)
+
+        def export(job, prepared):
+            service.memory_budget.release(prepared.reservation)
+            if prepared.asset["name"] == "broken.ab":
+                raise RuntimeError("export failed")
+            return prepared.asset["name"]
+
+        service.prepare_one = prepare
+        service.export_one = export
+        service.mark_skipped = lambda job, asset, error: skipped.append((asset["name"], str(error)))
+        assets = [{"name": name} for name in ("first.ab", "broken.ab", "last.ab")]
+        job = Job(id="pipeline-skip-test", total=len(assets))
+
+        service.process_assets(job, "https://example.invalid", assets)
+
+        self.assertEqual(job.completed, 2)
+        self.assertEqual(job.failed, 1)
+        self.assertEqual(job.skipped, 1)
+        self.assertEqual(skipped, [("broken.ab", "export failed")])
+        self.assertEqual(service.memory_budget.snapshot()["usedBytes"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

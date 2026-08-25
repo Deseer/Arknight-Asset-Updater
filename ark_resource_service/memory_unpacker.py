@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import os
 import re
@@ -30,6 +31,29 @@ EXPORT_TYPE_ALIASES = {
     "masterdata": "masterdata",
     "typetree": "typetree",
 }
+
+
+def install_unitypy_gzip_fallback() -> None:
+    """Treat false-positive GZIP headers inside Unity bundles as resource data."""
+    from UnityPy.helpers import ImportHelper
+
+    current = ImportHelper.check_file_type
+    if getattr(current, "_ark_gzip_fallback", False):
+        return
+
+    def tolerant_check_file_type(input_):
+        try:
+            return current(input_)
+        except gzip.BadGzipFile:
+            if isinstance(input_, ImportHelper.EndianBinaryReader):
+                reader = input_
+            else:
+                reader = ImportHelper.EndianBinaryReader(input_)
+            reader.Position = 0
+            return ImportHelper.FileType.ResourceFile, reader
+
+    tolerant_check_file_type._ark_gzip_fallback = True
+    ImportHelper.check_file_type = tolerant_check_file_type
 
 
 def parse_export_types(value: str) -> frozenset[str]:
@@ -71,6 +95,11 @@ class MemoryUnpacker:
         from src.ResolveSpine import SpineAsset
         from src.DecodeTextAsset import ArkAESLibrary, ArkFBOLibrary, FBOHandler
         from src.utils.SaverUtils import SafeSaver
+
+        # UnityPy 1.25.3 probes any nested payload beginning with 1f 8b as GZIP.
+        # Some valid Arknights resource nodes collide with those two bytes but use a
+        # non-GZIP third byte; fall back to ResourceFile instead of aborting the bundle.
+        install_unitypy_gzip_fallback()
 
         self.UnityPy = UnityPy
         self.Resource = Resource
