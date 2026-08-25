@@ -40,14 +40,14 @@ Spine、Mesh 和 TypeTree；USM 使用其 `cu` 模式。上游 BSD-3-Clause 许�
 `Bundles`、`Downloads`、`State` 或 `Logs`。状态和日志保存在 Docker 命名卷
 `ark-resource-state`。
 
-导出结构固定为 `<官方清单资源路径去掉扩展名>/...`，例如 `battle/enm_pfb_24.ab`
-对应 `/Volumes/wd/ArkResourceService/battle/enm_pfb_24/`。每个资源在同分类目录内使用
-隐藏 staging，全部成功后整目录原子替换，避免新版与旧版文件混杂。命名卷中的
-`State/unpacked_records.json` 记录官方路径、hash、MD5、输出目录和导出数量。
+导出优先使用 Unity 内部 container 语义路径。CDN 分包会合并到实际素材目录，构建标记
+`[uc]`、`[ucp]`、`[pack]` 会被移除；同一路径的 Sprite 与 backing Texture2D 只导出
+Sprite。命名卷中的 `State/unpacked_records.json` 记录官方路径、hash、MD5 和导出数量。
 
 内存参数位于项目根目录 `.env`，Compose 和应用共同读取。修改后执行 `docker compose up -d`
 即可重建限制。本机 16 GB、OrbStack VM 8 GB，默认应用在途预算
-768 MB、下载并发 1、容器硬上限 2 GB、共享内存 768 MB。聚合包引导默认关闭，
+768 MB、下载 worker 2、无 Compose 容器内存硬上限、共享内存 768 MB。容器仍受
+OrbStack VM 总内存约束。聚合包引导默认关闭，
 每个官方资源 `.dat` 独立下载、内存解包并释放，以避免 Unity 解码时的叠加内存峰值。
 调试用途的 TypeTree JSON 默认关闭；全量 Shader TypeTree 会在单个资源上产生超过 2 GB 的
 内存峰值。图片、文本、音频、Spine 和 Mesh 仍正常导出。
@@ -55,6 +55,7 @@ Spine、Mesh 和 TypeTree；USM 使用其 `cu` 模式。上游 BSD-3-Clause 许�
 ```bash
 docker compose up -d --build
 curl http://127.0.0.1:18080/healthz
+```
 
 ### Export types and output layout
 
@@ -78,4 +79,11 @@ anonymous binary input is never written to the external disk.
 `lipsync/voice*/*.bytes` contains small lip-animation timing data and is intentionally
 kept as bytes. Spoken voice audio is separate under `audio/sound_beta_2/voice*/` and
 exports as playable OGG/WAV files when those later manifest entries are processed.
-```
+
+This host uses two download workers without a Compose memory hard limit. The shared
+768 MB `MemoryBudget` gates compressed bytes in flight, while decoded Unity objects
+may use more memory and remain bounded by the OrbStack VM.
+The Docker health probe runs once per 60 seconds and marks the service unhealthy only
+after three consecutive failures.
+Container logs emit `asset_start` and `asset_done` records with worker name, official
+resource path, byte sizes, exported file count, and elapsed milliseconds.

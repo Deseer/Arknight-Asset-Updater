@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import random
 import shutil
@@ -24,6 +25,7 @@ CONFIG_URL = "https://ak-conf.hypergryph.com/config/prod/official/network_config
 PLATFORM = "Android"
 USER_AGENT = "ArkResourceService/1.0"
 EXPORT_LAYOUT_VERSION = "semantic-container-v1"
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 def utc_now() -> str:
@@ -159,7 +161,7 @@ class Service:
         self.legacy_root = Path(os.getenv("ARK_LEGACY_ROOT", "/nonexistent-legacy-root"))
         config = load_json(Path(os.getenv("ARK_CONFIG", "/app/config/service.json")), {})
         self.poll_seconds = max(2.0, float(os.getenv("ARK_POLL_SECONDS", config.get("pollSeconds", 5))))
-        self.workers = max(1, min(2, int(os.getenv("ARK_DOWNLOAD_WORKERS", config.get("downloadWorkers", 2)))))
+        self.workers = max(1, int(os.getenv("ARK_DOWNLOAD_WORKERS", config.get("downloadWorkers", 2))))
         self.bootstrap_packs = os.getenv("ARK_BOOTSTRAP_PACKS", str(config.get("bootstrapPacks", True))).lower() == "true"
         from .memory_unpacker import parse_export_types
 
@@ -175,7 +177,7 @@ class Service:
             if item.strip()
         )
         self.memory_budget_mb = max(512, int(os.getenv("ARK_MEMORY_BUDGET_MB", config.get("memoryBudgetMB", 768))))
-        self.container_memory_limit = os.getenv("ARK_CONTAINER_MEMORY_LIMIT", "2g")
+        self.container_memory_limit = os.getenv("ARK_CONTAINER_MEMORY_LIMIT", "unlimited")
         self.container_shm_size = os.getenv("ARK_CONTAINER_SHM_SIZE", "768m")
         self.memory_budget = MemoryBudget(self.memory_budget_mb * 1024 * 1024)
         self.unpacker_root = Path(os.getenv("ARK_UNPACKER_ROOT", "/opt/ark-unpacker"))
@@ -275,6 +277,7 @@ class Service:
             job.status, job.phase, job.detail = "cancelled", "cancelled", str(error)
             self.save_job(job)
         except Exception as error:
+            LOGGER.exception("asset_sync_failed job=%s phase=%s detail=%s", job.id, job.phase, job.detail)
             self.sync_failures += 1
             self.next_sync_attempt = time.time() + min(300.0, 15.0 * (2 ** min(self.sync_failures - 1, 4)))
             job.failed += 1
@@ -428,6 +431,16 @@ class Service:
 
     def download_one(self, job: Job, base: str, asset: dict[str, Any]) -> str:
         name = asset["name"]
+        started = time.monotonic()
+        worker = threading.current_thread().name
+        LOGGER.info(
+            "asset_start job=%s worker=%s name=%s downloadBytes=%s bundleBytes=%s",
+            job.id,
+            worker,
+            name,
+            asset.get("totalSize", 0),
+            asset.get("abSize", 0),
+        )
         reserve = max(int(asset.get("totalSize", 0) or 0) + int(asset.get("abSize", 0) or 0), 1024 * 1024)
         self.memory_budget.acquire(reserve)
         try:
@@ -436,9 +449,17 @@ class Service:
             with zipfile.ZipFile(io.BytesIO(archive)) as source:
                 if name not in source.namelist():
                     raise RuntimeError(f"archive did not contain {name}")
-                self.validate_and_unpack(job, source.read(name), asset)
+                exported = self.validate_and_unpack(job, source.read(name), asset)
         finally:
             self.memory_budget.release(reserve)
+        LOGGER.info(
+            "asset_done job=%s worker=%s name=%s exported=%s elapsedMs=%s",
+            job.id,
+            worker,
+            name,
+            exported,
+            round((time.monotonic() - started) * 1000),
+        )
         return name
 
     def watch(self) -> None:
