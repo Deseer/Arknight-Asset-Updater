@@ -269,9 +269,6 @@ class Service:
         for name in ("State", "Logs"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         self.output_root.mkdir(parents=True, exist_ok=True)
-        for stale in self.output_root.rglob(".ark-staging-*"):
-            if stale.is_dir():
-                shutil.rmtree(stale, ignore_errors=True)
 
     def save_job(self, job: Job) -> None:
         job.updated_at = utc_now()
