@@ -3,10 +3,48 @@ import time
 import unittest
 from pathlib import Path
 
-from ark_resource_service.app import Job, MemoryBudget, PreparedAsset, Service, dat_name, safe_member
+from ark_resource_service.app import (
+    Job,
+    MemoryBudget,
+    OfficialClient,
+    PreparedAsset,
+    Service,
+    dat_name,
+    safe_member,
+)
 
 
 class CoreTests(unittest.TestCase):
+    def test_configured_cdn_overrides_discovered_cdn(self):
+        client = OfficialClient(Path("/tmp"), cdn_root="https://configured.invalid/root/")
+
+        class Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "content": {
+                        "funcVer": "v1",
+                        "configs": {
+                            "v1": {
+                                "network": {
+                                    "hv": "https://version.invalid/{0}",
+                                    "hu": "https://discovered.invalid/root",
+                                }
+                            }
+                        },
+                    }
+                }
+
+        client.session.get = lambda *args, **kwargs: Response()
+        client.discover()
+
+        self.assertEqual(client.cdn_root, "https://configured.invalid/root")
+        self.assertEqual(client.version_url, "https://version.invalid/Android")
+
     def test_dat_name_matches_official_cdn_convention(self):
         self.assertEqual(dat_name("arts/chararts/char_002_amiya#1.ab"), "arts_chararts_char_002_amiya__1.dat")
 

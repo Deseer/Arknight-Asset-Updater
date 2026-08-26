@@ -116,12 +116,13 @@ class MemoryBudget:
 
 
 class OfficialClient:
-    def __init__(self, root: Path, download_pool_size: int = 2):
+    def __init__(self, root: Path, download_pool_size: int = 2, cdn_root: str = ""):
         self.root = root
         self.session = requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
         self.download_pool_size = max(1, download_pool_size)
         self.download_sessions = threading.local()
+        self.configured_cdn_root = cdn_root.strip().rstrip("/")
         self.version_url = ""
         self.cdn_root = ""
         self.etag = ""
@@ -172,7 +173,8 @@ class OfficialClient:
             config = json.loads(content) if isinstance(content, str) else content
             network = config["configs"][config["funcVer"]]["network"]
             self.version_url = network["hv"].replace("{0}", PLATFORM)
-            self.cdn_root = network["hu"].rstrip("/")
+            discovered_cdn_root = network["hu"].rstrip("/")
+            self.cdn_root = self.configured_cdn_root or discovered_cdn_root
             self.last_network_refresh = time.time()
 
     def check_version(self, conditional: bool = True) -> tuple[bool, dict[str, str]]:
@@ -243,7 +245,8 @@ class Service:
         self.memory_budget = MemoryBudget(self.memory_budget_mb * 1024 * 1024)
         self.unpacker_root = Path(os.getenv("ARK_UNPACKER_ROOT", "/opt/ark-unpacker"))
         self.memory_unpacker = None
-        self.client = OfficialClient(self.root, self.download_workers)
+        configured_cdn_root = os.getenv("ARK_CDN_ROOT", str(config.get("cdnRoot", "")))
+        self.client = OfficialClient(self.root, self.download_workers, configured_cdn_root)
         self.jobs: dict[str, Job] = {}
         self.active_job: str | None = None
         self.lock = threading.Lock()
@@ -717,6 +720,7 @@ def runtime_config() -> dict[str, Any]:
         "exportWorkers": service.export_workers,
         "prefetchBundles": service.prefetch_bundles,
         "decodeMemoryFactor": service.decode_memory_factor,
+        "cdnSource": "config" if service.client.configured_cdn_root else "official_discovery",
         "containerMemoryLimit": service.container_memory_limit,
         "sharedMemorySize": service.container_shm_size,
         "pollSeconds": service.poll_seconds,

@@ -22,6 +22,7 @@ services:
       ARK_UNPACKER_ROOT: /opt/ark-unpacker
       HOME: /tmp
     volumes:
+      - "${ARK_SERVICE_CONFIG_PATH}:/app/config/service.json:ro"
       - /Volumes/wd/ArkResourceService:/output
       - ark-resource-state:/state
     shm_size: "${ARK_CONTAINER_SHM_SIZE:-768m}"

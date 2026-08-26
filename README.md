@@ -12,10 +12,26 @@ UnityPy + LZ4AK，只把导出物写入外置盘。USM 因 ffmpeg 需要路径�
 - 路由发现：`https://ak-conf.hypergryph.com/config/prod/official/network_config`
 - 版本：路由配置的 `hv` 模板，当前为
   `https://ak-conf.hypergryph.com/config/prod/official/Android/version`
-- CDN：路由配置的 `hu`，不在代码中写死最终资源地址
+- 资源根地址：优先读取仓库外的本机私有配置，未配置时使用官方路由发现值
 - 默认每 5 秒条件请求版本文件；利用 `ETag`/`If-None-Match`，未变化返回 304
 - 仅版本变化或本地同步未完成时获取 `hot_update_list.json`
 - 网络错误指数退避，路由配置每小时刷新或失败时强制刷新
+- 实际资源根地址不保存在项目目录、示例配置或 Git 历史中。
+
+## 配置
+
+首次部署先复制公开模板到仓库外，并让本机 `.env` 指向它：
+
+```bash
+cp .env.example .env
+mkdir -p /path/to/private/config
+cp config/service.example.json /path/to/private/config/service.json
+# 编辑 .env 中的 ARK_SERVICE_CONFIG_PATH
+```
+
+`.env` 已加入 `.gitignore`，其中只保存仓库外私有配置文件的绝对路径。仓库中的
+`config/service.example.json` 只包含公开的运行参数，不含私有资源地址。服务未获得私有
+地址时会从官方网络配置自动发现。
 
 ## 解包
 

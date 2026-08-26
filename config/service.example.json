@@ -1,0 +1,9 @@
+{
+  "pollSeconds": 5,
+  "downloadWorkers": 2,
+  "exportWorkers": 2,
+  "prefetchBundles": 2,
+  "memoryBudgetMB": 768,
+  "decodeMemoryFactor": 6,
+  "bootstrapPacks": false
+}
