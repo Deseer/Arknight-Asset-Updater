@@ -324,43 +324,61 @@ class MemoryUnpacker:
                     continue
         return exported
 
-    def unpack_usm(self, data: bytes, asset_name: str, job_id: str) -> int:
-        # ffmpeg and Ark-Unpacker's USM parser require a path. /dev/shm is tmpfs,
-        # so the compressed source never touches the external drive.
-        memory_root = Path("/dev/shm/ark-resource-service") / job_id
-        memory_root.mkdir(parents=True, exist_ok=True)
-        source = memory_root / PurePosixPath(asset_name).name
-        source.write_bytes(data)
+    def unpack_usm(self, data: bytes, asset_name: str, _job_id: str) -> int:
+        import cridecoder
+
+        if len(data) < 4 or data[:4] != b"CRID":
+            raise ValueError("USM input does not begin with CRID")
+        streams = cridecoder.extract_usm_bytes(data, key=None, export_audio=True)
         destination = self._destination(asset_name)
         staging = self._staging_directory(destination)
-        log = self.log_root / f"{job_id}-usm.log"
-        log.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            "python",
-            str(self.unpacker_root / "Main.py"),
-            "--input",
-            str(source),
-            "--output",
-            str(staging),
-            "--logging-level",
-            "3",
-            "--mode",
-            "cu",
-        ]
+        exported = 0
+        asset_stem = self._clean_component(PurePosixPath(asset_name).stem)
+        video_formats = {"ivf": "ivf", "m2v": "mpegvideo", "h264": "h264"}
         try:
-            with log.open("a", encoding="utf-8") as output:
-                result = subprocess.run(command, cwd=self.unpacker_root, stdout=output, stderr=subprocess.STDOUT)
-            if result.returncode:
-                raise RuntimeError(f"USM unpacker exited {result.returncode}")
-            exported = sum(1 for p in staging.rglob("*") if p.is_file())
+            for index, stream in enumerate(streams):
+                extension = str(stream.get("extension") or "bin").lstrip(".")
+                payload = bytes(stream["data"])
+                stem = asset_stem if len(streams) == 1 else f"{asset_stem}_{index}"
+                input_format = video_formats.get(extension.lower())
+                if input_format:
+                    target = staging / f"{stem}.mp4"
+                    result = subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-y",
+                            "-f",
+                            input_format,
+                            "-i",
+                            "pipe:0",
+                            "-an",
+                            "-c:v",
+                            "libx264",
+                            "-pix_fmt",
+                            "yuv420p",
+                            str(target),
+                        ],
+                        input=payload,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
+                    if result.returncode != 0 or not target.is_file():
+                        raise RuntimeError(
+                            f"ffmpeg failed for {asset_name}: "
+                            + result.stderr.decode("utf-8", errors="replace")[-1000:]
+                        )
+                else:
+                    target = staging / f"{stem}.{extension}"
+                    target.write_bytes(payload)
+                exported += 1
             self._commit(staging, destination)
             return exported
-        finally:
-            source.unlink(missing_ok=True)
-            try:
-                memory_root.rmdir()
-            except OSError:
-                pass
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
     def unpack(self, data: bytes, asset_name: str, job_id: str) -> int:
         if asset_name.endswith((".ab", ".bin")):

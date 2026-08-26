@@ -1,4 +1,4 @@
-# Arknights Resource Service
+# Arknight Asset Updater
 
 常驻同步、校验并解包明日方舟国服 Android 官方资源。项目借鉴
 Haruki Sekai Asset Updater 的任务/阶段/单任务执行模型，但下载协议和解包后端均针对明日方舟实现。
@@ -37,7 +37,11 @@ cp config/service.example.json /path/to/private/config/service.json
 
 `vendor/Ark-Unpacker` 固定在提交 `8b4101f36bc9ccb283fff272928c3f0b23583980`。
 其 `ResolveAB.py` 向 UnityPy 注册明日方舟自定义 LZ4AK 解压函数，再导出图片、文本、音频、
-Spine、Mesh 和 TypeTree；USM 使用其 `cu` 模式。上游 BSD-3-Clause 许可证保留在 vendor 目录。
+Spine、Mesh、TypeTree 和 FlatBuffers MasterData。上游代码采用 BSD-3-Clause，原始许可证
+保留在 vendor 目录并复制进容器 `/licenses`；详细来源见 `THIRD_PARTY_NOTICES.md`。
+
+USM 不调用上游命令行模式，而是通过 cridecoder 的内存 API 拆流，并将视频字节从 stdin
+交给 ffmpeg 生成 MP4。外置盘不会出现 USM 或 IVF 中间文件。
 
 ## API
 

@@ -1,7 +1,14 @@
 import gzip
 from io import BytesIO
+from pathlib import Path
 import random
+import subprocess
+import sys
+import tempfile
+import threading
+import types
 import unittest
+from unittest import mock
 
 from ark_resource_service.memory_unpacker import (
     MemoryUnpacker,
@@ -51,6 +58,34 @@ class UnityPyProbeTests(unittest.TestCase):
             MemoryUnpacker.semantic_container_path("assets/[uc]lipsync/[ucp]voice/file.bytes").as_posix(),
             "lipsync/voice/file.bytes",
         )
+
+
+class UsmMemoryExportTests(unittest.TestCase):
+    def test_video_stream_is_piped_to_mp4_without_raw_intermediate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            unpacker = MemoryUnpacker.__new__(MemoryUnpacker)
+            unpacker.output_root = Path(temporary)
+            unpacker._write_lock = threading.Lock()
+            decoder = types.SimpleNamespace(
+                extract_usm_bytes=lambda *_args, **_kwargs: [
+                    {"extension": "ivf", "data": b"video-stream"}
+                ]
+            )
+
+            def fake_run(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"mp4")
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            with mock.patch.dict(sys.modules, {"cridecoder": decoder}), mock.patch(
+                "ark_resource_service.memory_unpacker.subprocess.run", side_effect=fake_run
+            ):
+                exported = unpacker.unpack_usm(
+                    b"CRIDpayload", "raw/video/sample.usm", "test-job"
+                )
+
+            files = [path for path in Path(temporary).rglob("*") if path.is_file()]
+            self.assertEqual(exported, 1)
+            self.assertEqual([path.name for path in files], ["sample.mp4"])
 
 
 if __name__ == "__main__":
