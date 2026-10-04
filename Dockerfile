@@ -1,3 +1,13 @@
+FROM python:3.12-slim-bookworm AS schema-builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends flatbuffers-compiler \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/refresh_flatbuffer_schemas.py /tmp/refresh_flatbuffer_schemas.py
+RUN python /tmp/refresh_flatbuffer_schemas.py \
+      --destination /generated \
+      --work-dir /tmp/ark-fbs
+
 FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -15,6 +25,7 @@ COPY vendor/Ark-Unpacker/pyproject.toml vendor/Ark-Unpacker/poetry.lock ./
 RUN python -m pip install --no-cache-dir "poetry>=2.0,<3.0" \
     && poetry install --only main --no-root --no-ansi
 COPY vendor/Ark-Unpacker/ ./
+COPY --from=schema-builder /generated/ /opt/ark-unpacker/src/fbs/CN/
 
 WORKDIR /app
 COPY requirements-service.txt ./

@@ -4,6 +4,7 @@
   "exportWorkers": 2,
   "prefetchBundles": 2,
   "memoryBudgetMB": 768,
+  "recycleAfterUpdatedJob": true,
   "decodeMemoryFactor": 6,
   "bootstrapPacks": false
 }

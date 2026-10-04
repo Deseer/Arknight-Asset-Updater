@@ -33,6 +33,28 @@ EXPORT_TYPE_ALIASES = {
 }
 
 
+class MasterDataDecodeError(RuntimeError):
+    """A known FlatBuffers table could not be decoded with the bundled schema."""
+
+
+def repair_roguelike_topic_init(module: Any) -> None:
+    """Preserve the `init` field shadowed by flatc's Python Init method."""
+    from flatbuffers.table import Table
+
+    detail = module.clz_Torappu_RoguelikeTopicDetail
+    if getattr(detail, "_ark_init_field_fixed", False):
+        return
+    detail.InitialData = detail.Init
+    detail.InitialDataLength = detail.InitLength
+    detail.InitialDataIsNone = detail.InitIsNone
+
+    def initialize(self, buf, pos):
+        self._tab = Table(buf, pos)
+
+    detail.Init = initialize
+    detail._ark_init_field_fixed = True
+
+
 def install_unitypy_gzip_fallback() -> None:
     """Treat false-positive GZIP headers inside Unity bundles as resource data."""
     from UnityPy.helpers import ImportHelper
@@ -174,9 +196,14 @@ class MemoryUnpacker:
             if target.is_file():
                 if target.read_bytes() == item.data:
                     return False
-                target = target.with_name(f"{target.stem}__{path_id}{target.suffix}")
-                if target.is_file() and target.read_bytes() == item.data:
-                    return False
+                # MasterData table names are stable runtime interfaces.  A newer
+                # table must atomically replace the previous snapshot instead of
+                # being treated as an unrelated same-name asset.  Other semantic
+                # exports can genuinely collide, so keep their path-id suffixes.
+                if not relative.parts or relative.parts[0].lower() != "masterdata":
+                    target = target.with_name(f"{target.stem}__{path_id}{target.suffix}")
+                    if target.is_file() and target.read_bytes() == item.data:
+                        return False
             temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
             temporary.write_bytes(item.data)
             os.replace(temporary, target)
@@ -200,14 +227,21 @@ class MemoryUnpacker:
         for module in self.ArkFBOLibrary.CN:
             schema = module.__name__.split(".")[-1]
             if schema in lowered:
-                candidates.append((schema, getattr(module, "ROOT_TYPE", None)))
-        for schema, root_type in sorted(candidates, key=lambda value: len(value[0]), reverse=True):
+                candidates.append((schema, getattr(module, "ROOT_TYPE", None), module))
+        schema_errors: list[tuple[str, Exception]] = []
+        for schema, root_type, module in sorted(candidates, key=lambda value: len(value[0]), reverse=True):
             if root_type is None or len(raw) <= 128:
                 continue
             try:
-                return schema, self.FBOHandler(bytearray(raw)[128:], root_type).to_json_dict()
-            except Exception:
-                continue
+                if schema == "roguelike_topic_table":
+                    repair_roguelike_topic_init(module)
+                decoded = self.FBOHandler(bytearray(raw)[128:], root_type).to_json_dict()
+                if schema == "roguelike_topic_table":
+                    for detail in decoded["Details"].values():
+                        detail["Init"] = detail.pop("InitialData", None)
+                return schema, decoded
+            except Exception as error:
+                schema_errors.append((schema, error))
         try:
             decrypted = self.ArkAESLibrary.aes_cbc_decrypt_bytes(raw, self.ArkAESLibrary.MASK_V2)
             try:
@@ -216,7 +250,13 @@ class MemoryUnpacker:
                 import bson
 
                 return re.sub(r"[^a-zA-Z0-9_.-]+", "_", name), bson.loads(decrypted)
-        except Exception:
+        except Exception as fallback_error:
+            if schema_errors:
+                schema, schema_error = schema_errors[0]
+                raise MasterDataDecodeError(
+                    f"FlatBuffers schema mismatch for {name} ({schema}): "
+                    f"{type(schema_error).__name__}: {schema_error}"
+                ) from fallback_error
             return None
 
     def unpack_ab(self, data: bytes, asset_name: str) -> int:
@@ -293,6 +333,8 @@ class MemoryUnpacker:
                             )
                             fallback = fallback_root / f"{item.name}{item.ext}"
                             exported += int(self._write_semantic_item(fallback, item, reader.path_id))
+                except MasterDataDecodeError:
+                    raise
                 except Exception:
                     continue
 

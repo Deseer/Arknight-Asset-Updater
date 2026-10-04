@@ -1,6 +1,8 @@
 import tempfile
 import time
 import unittest
+import threading
+from unittest import mock
 from pathlib import Path
 
 from ark_resource_service.app import (
@@ -11,10 +13,101 @@ from ark_resource_service.app import (
     Service,
     dat_name,
     safe_member,
+    ROGUELIKE_TOPIC_SKIP_REVISION,
+    TERMINAL_SKIP_REVISION,
 )
 
 
 class CoreTests(unittest.TestCase):
+    @staticmethod
+    def record_service(root: Path) -> Service:
+        service = Service.__new__(Service)
+        service.root = root
+        service.records = {}
+        service.records_lock = threading.Lock()
+        service.records_journal = root / "State" / "unpacked_records.jsonl"
+        service.export_types = frozenset({"masterdata"})
+        service.typetree_types = frozenset()
+        unpacker = mock.Mock()
+        unpacker.relative_destination.return_value = "anon/resource"
+        service.get_unpacker = mock.Mock(return_value=unpacker)
+        return service
+
+    def test_schema_skip_is_current_until_skip_revision_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            service = self.record_service(Path(temporary))
+            asset = {"name": "anon/resource.bin", "hash": "h1", "md5": "m1", "abSize": 10}
+            error = type("MasterDataDecodeError", (RuntimeError,), {})("schema mismatch")
+
+            service.mark_skipped(Job(id="skip"), asset, error)
+
+            self.assertTrue(service.is_current(asset))
+            record = service.records[asset["name"]]
+            self.assertTrue(record["terminalSkip"])
+            self.assertEqual(record["terminalSkipRevision"], TERMINAL_SKIP_REVISION)
+            record["terminalSkipRevision"] = "older-schema"
+            self.assertFalse(service.is_current(asset))
+
+    def test_roguelike_schema_repair_retries_only_its_previous_skip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            service = self.record_service(Path(temporary))
+            asset = {"name": "gamedata/excel/roguelike_topic_table.ab", "hash": "h1", "md5": "m1", "abSize": 10}
+            error = type("MasterDataDecodeError", (RuntimeError,), {})("schema mismatch")
+            service.mark_skipped(Job(id="skip"), asset, error)
+            record = service.records[asset["name"]]
+            self.assertEqual(record["terminalSkipRevision"], ROGUELIKE_TOPIC_SKIP_REVISION)
+            self.assertTrue(service.is_current(asset))
+            record["terminalSkipRevision"] = TERMINAL_SKIP_REVISION
+            self.assertFalse(service.is_current(asset))
+
+    def test_transient_skip_is_not_marked_current(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            service = self.record_service(Path(temporary))
+            asset = {"name": "anon/resource.bin", "hash": "h1", "md5": "m1", "abSize": 10}
+
+            service.mark_skipped(Job(id="skip"), asset, RuntimeError("temporary failure"))
+
+            self.assertFalse(service.is_current(asset))
+
+    @staticmethod
+    def recycle_service() -> Service:
+        service = Service.__new__(Service)
+        service.recycle_after_updated_job = True
+        service.recycle_scheduled = False
+        return service
+
+    @mock.patch("ark_resource_service.app.threading.Timer")
+    def test_resource_bearing_completed_job_schedules_one_recycle(self, timer):
+        service = self.recycle_service()
+        job = Job(id="updated", status="completed", total=3, completed=3)
+
+        self.assertTrue(service.schedule_recycle_after_updated_job(job))
+        self.assertFalse(service.schedule_recycle_after_updated_job(job))
+
+        timer.assert_called_once()
+        timer.return_value.start.assert_called_once_with()
+
+    @mock.patch("ark_resource_service.app.threading.Timer")
+    def test_empty_or_failed_job_does_not_schedule_recycle(self, timer):
+        service = self.recycle_service()
+
+        self.assertFalse(
+            service.schedule_recycle_after_updated_job(
+                Job(id="empty", status="completed", total=0)
+            )
+        )
+        self.assertFalse(
+            service.schedule_recycle_after_updated_job(
+                Job(id="failed", status="failed", total=2, failed=1)
+            )
+        )
+        self.assertFalse(
+            service.schedule_recycle_after_updated_job(
+                Job(id="skipped-only", status="completed", total=1, failed=1, skipped=1)
+            )
+        )
+        timer.assert_not_called()
+
     def test_configured_cdn_overrides_discovered_cdn(self):
         client = OfficialClient(Path("/tmp"), cdn_root="https://configured.invalid/root/")
 

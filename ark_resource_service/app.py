@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import signal
 import shutil
 import threading
 import time
@@ -26,6 +27,8 @@ CONFIG_URL = "https://ak-conf.hypergryph.com/config/prod/official/network_config
 PLATFORM = "Android"
 USER_AGENT = "ArkResourceService/1.0"
 EXPORT_LAYOUT_VERSION = "semantic-container-v1"
+TERMINAL_SKIP_REVISION = "flatbuffers-schema-v1"
+ROGUELIKE_TOPIC_SKIP_REVISION = "roguelike-topic-init-v1"
 LOGGER = logging.getLogger("uvicorn.error")
 
 
@@ -242,6 +245,10 @@ class Service:
         self.memory_budget_mb = max(512, int(os.getenv("ARK_MEMORY_BUDGET_MB", config.get("memoryBudgetMB", 768))))
         self.container_memory_limit = os.getenv("ARK_CONTAINER_MEMORY_LIMIT", "unlimited")
         self.container_shm_size = os.getenv("ARK_CONTAINER_SHM_SIZE", "768m")
+        self.recycle_after_updated_job = os.getenv(
+            "ARK_RECYCLE_AFTER_UPDATED_JOB",
+            str(config.get("recycleAfterUpdatedJob", True)),
+        ).lower() == "true"
         self.memory_budget = MemoryBudget(self.memory_budget_mb * 1024 * 1024)
         self.unpacker_root = Path(os.getenv("ARK_UNPACKER_ROOT", "/opt/ark-unpacker"))
         self.memory_unpacker = None
@@ -266,6 +273,7 @@ class Service:
         self.watcher: threading.Thread | None = None
         self.sync_failures = 0
         self.next_sync_attempt = 0.0
+        self.recycle_scheduled = False
         for name in ("State", "Logs"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -344,6 +352,43 @@ class Service:
             with self.lock:
                 if self.active_job == job.id:
                     self.active_job = None
+            self.schedule_recycle_after_updated_job(job)
+
+    def schedule_recycle_after_updated_job(self, job: Job) -> bool:
+        """Recycle native decoder state after a resource-bearing update.
+
+        UnityPy and Ark-Unpacker load native codecs which may retain worker
+        threads and large arenas after the Python export pool has drained.  A
+        fresh service process is the only reliable boundary for those native
+        resources.  The persisted manifest and job are written before this is
+        called, so Docker can restart the service without repeating downloads.
+        Jobs with no successfully processed resources never recycle, preventing
+        a startup loop when the same schema-incompatible asset remains skipped.
+        """
+        if (
+            not self.recycle_after_updated_job
+            or self.recycle_scheduled
+            or job.status != "completed"
+            or job.total <= 0
+            or job.completed <= 0
+        ):
+            return False
+
+        self.recycle_scheduled = True
+        LOGGER.info(
+            "asset_service_recycle_scheduled job=%s total=%s completed=%s skipped=%s",
+            job.id,
+            job.total,
+            job.completed,
+            job.skipped,
+        )
+
+        def recycle() -> None:
+            LOGGER.info("asset_service_recycle_start job=%s", job.id)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Timer(2.0, recycle).start()
+        return True
 
     @property
     def records_path(self) -> Path:
@@ -352,12 +397,22 @@ class Service:
     def is_current(self, asset: dict[str, Any]) -> bool:
         with self.records_lock:
             record = self.records.get(asset["name"])
-        return bool(
+        if not (
             record
             and record.get("hash") == asset.get("hash")
             and record.get("md5") == asset.get("md5")
             and record.get("exportProfile") == self.export_profile
-        )
+        ):
+            return False
+        if record.get("terminalSkip"):
+            return record.get("terminalSkipRevision") == self.terminal_skip_revision(asset)
+        return True
+
+    @staticmethod
+    def terminal_skip_revision(asset: dict[str, Any]) -> str:
+        if "roguelike_topic_table" in str(asset.get("name", "")).lower():
+            return ROGUELIKE_TOPIC_SKIP_REVISION
+        return TERMINAL_SKIP_REVISION
 
     @property
     def export_profile(self) -> str:
@@ -400,6 +455,31 @@ class Service:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as output:
                 output.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # A schema mismatch is deterministic for this exact asset and
+            # decoder revision. Persist it so service restarts do not download
+            # and decode the same known-incompatible bundle forever. Bumping
+            # TERMINAL_SKIP_REVISION after a decoder/schema repair retries only
+            # these terminal skips; successful records remain current.
+            if type(error).__name__ == "MasterDataDecodeError":
+                record = {
+                    "hash": asset.get("hash", ""),
+                    "md5": asset.get("md5", ""),
+                    "size": int(asset.get("abSize", 0) or 0),
+                    "exported": 0,
+                    "exportProfile": self.export_profile,
+                    "outputDir": self.get_unpacker().relative_destination(asset["name"]),
+                    "unpackedAt": utc_now(),
+                    "terminalSkip": True,
+                    "terminalSkipRevision": self.terminal_skip_revision(asset),
+                    "terminalSkipError": entry["error"],
+                }
+                self.records[asset["name"]] = record
+                self.records_journal.parent.mkdir(parents=True, exist_ok=True)
+                with self.records_journal.open("a", encoding="utf-8") as journal:
+                    journal.write(
+                        json.dumps({"name": asset["name"], "record": record}, ensure_ascii=False)
+                        + "\n"
+                    )
 
     def get_unpacker(self):
         if self.memory_unpacker is None:
@@ -720,6 +800,7 @@ def runtime_config() -> dict[str, Any]:
         "cdnSource": "config" if service.client.configured_cdn_root else "official_discovery",
         "containerMemoryLimit": service.container_memory_limit,
         "sharedMemorySize": service.container_shm_size,
+        "recycleAfterUpdatedJob": service.recycle_after_updated_job,
         "pollSeconds": service.poll_seconds,
         "exportTypes": sorted(service.export_types),
         "typeTreeTypes": sorted(service.typetree_types),

@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from ark_resource_service.memory_unpacker import (
+    MasterDataDecodeError,
     MemoryUnpacker,
     install_unitypy_gzip_fallback,
     parse_export_types,
@@ -32,6 +33,71 @@ class SemanticPathTests(unittest.TestCase):
             MemoryUnpacker.semantic_container_path("dyn/ui/[pack]charselect/icon.png").as_posix(),
             "ui/charselect/icon.png",
         )
+
+
+class SemanticWriteTests(unittest.TestCase):
+    @staticmethod
+    def unpacker(output_root: Path) -> MemoryUnpacker:
+        unpacker = MemoryUnpacker.__new__(MemoryUnpacker)
+        unpacker.output_root = output_root
+        unpacker._write_lock = threading.Lock()
+        return unpacker
+
+    def test_changed_masterdata_atomically_replaces_canonical_table(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "masterdata" / "character_table.json"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"old")
+            item = types.SimpleNamespace(name="character_table", ext=".json", data=b"new")
+
+            exported = self.unpacker(root)._write_semantic_item(
+                Path("masterdata/character_table"), item, 12345
+            )
+
+            self.assertTrue(exported)
+            self.assertEqual(target.read_bytes(), b"new")
+            self.assertFalse((root / "masterdata" / "character_table__12345.json").exists())
+
+    def test_changed_non_masterdata_keeps_path_id_collision_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "ui" / "icon.png"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"first")
+            item = types.SimpleNamespace(name="icon", ext=".png", data=b"second")
+
+            exported = self.unpacker(root)._write_semantic_item(Path("ui/icon.png"), item, 42)
+
+            self.assertTrue(exported)
+            self.assertEqual(target.read_bytes(), b"first")
+            self.assertEqual((root / "ui" / "icon__42.png").read_bytes(), b"second")
+
+
+class MasterDataDecodeTests(unittest.TestCase):
+    def test_known_flatbuffer_schema_failure_is_not_silently_exported_as_raw_text(self):
+        class BrokenHandler:
+            def __init__(self, *_args):
+                pass
+
+            def to_json_dict(self):
+                raise ValueError("outdated schema")
+
+        class BrokenAes:
+            MASK_V2 = object()
+
+            @staticmethod
+            def aes_cbc_decrypt_bytes(*_args):
+                raise ValueError("not encrypted json")
+
+        module = types.SimpleNamespace(__name__="src.fbs.CN.activity_table", ROOT_TYPE=object())
+        unpacker = MemoryUnpacker.__new__(MemoryUnpacker)
+        unpacker.ArkFBOLibrary = types.SimpleNamespace(CN=[module])
+        unpacker.FBOHandler = BrokenHandler
+        unpacker.ArkAESLibrary = BrokenAes
+
+        with self.assertRaisesRegex(MasterDataDecodeError, "activity_table"):
+            unpacker._decode_masterdata(b"x" * 256, "activity_table67f0f6")
 
 
 class UnityPyProbeTests(unittest.TestCase):
