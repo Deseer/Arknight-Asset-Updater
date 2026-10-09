@@ -37,6 +37,14 @@ class MasterDataDecodeError(RuntimeError):
     """A known FlatBuffers table could not be decoded with the bundled schema."""
 
 
+def encode_masterdata(schema: str, value: Any) -> bytes:
+    """Reject invalid decoded strings before replacing a usable snapshot."""
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+    except (ValueError, UnicodeError) as error:
+        raise MasterDataDecodeError(f"Invalid decoded JSON for {schema}: {error}") from error
+
+
 def repair_roguelike_topic_init(module: Any) -> None:
     """Preserve the `init` field shadowed by flatc's Python Init method."""
     from flatbuffers.table import Table
@@ -100,6 +108,7 @@ class MemoryUnpacker:
         log_root: Path,
         export_types: frozenset[str],
         typetree_types: frozenset[str] = frozenset(),
+        schema_directory: Path | None = None,
     ):
         self.unpacker_root = unpacker_root
         self.output_root = output_root
@@ -107,6 +116,7 @@ class MemoryUnpacker:
         self.export_types = export_types
         self.typetree_types = {value.lower() for value in typetree_types}
         self._write_lock = threading.Lock()
+        self._export_context = threading.local()
         root = str(unpacker_root)
         if root not in sys.path:
             sys.path.insert(0, root)
@@ -131,6 +141,16 @@ class MemoryUnpacker:
         self.ArkFBOLibrary = ArkFBOLibrary
         self.FBOHandler = FBOHandler
         self.SafeSaver = SafeSaver
+        self.schemas = list(self.ArkFBOLibrary.CN)
+        if schema_directory is not None:
+            from .schema_sync import load_modules
+            overlay = load_modules(schema_directory)
+            names = {module.__name__.split(".")[-1] for module in overlay}
+            self.schemas = [m for m in self.schemas if m.__name__.split(".")[-1] not in names] + overlay
+
+    @property
+    def decoded_tables(self) -> list[str]:
+        return sorted(getattr(self._export_context, "tables", set()))
 
     @staticmethod
     def _clean_component(component: str) -> str:
@@ -224,7 +244,7 @@ class MemoryUnpacker:
     def _decode_masterdata(self, raw: bytes, name: str) -> tuple[str, Any] | None:
         lowered = name.lower()
         candidates = []
-        for module in self.ArkFBOLibrary.CN:
+        for module in getattr(self, "schemas", self.ArkFBOLibrary.CN):
             schema = module.__name__.split(".")[-1]
             if schema in lowered:
                 candidates.append((schema, getattr(module, "ROOT_TYPE", None), module))
@@ -239,6 +259,7 @@ class MemoryUnpacker:
                 if schema == "roguelike_topic_table":
                     for detail in decoded["Details"].values():
                         detail["Init"] = detail.pop("InitialData", None)
+                encode_masterdata(schema, decoded)
                 return schema, decoded
             except Exception as error:
                 schema_errors.append((schema, error))
@@ -314,10 +335,12 @@ class MemoryUnpacker:
                         decoded = self._decode_masterdata(raw, getattr(obj, "m_Name", "textasset"))
                         if decoded:
                             schema, value = decoded
+                            if hasattr(self, "_export_context"):
+                                self._export_context.tables.add(schema)
                             item = self.SafeSaver.ExportItem(
                                 schema,
                                 ".json",
-                                json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8", errors="surrogateescape"),
+                                encode_masterdata(schema, value),
                             )
                             exported += int(self._write_semantic_item(PurePosixPath("masterdata") / schema, item, reader.path_id))
                             continue
@@ -423,6 +446,7 @@ class MemoryUnpacker:
             raise
 
     def unpack(self, data: bytes, asset_name: str, job_id: str) -> int:
+        self._export_context.tables = set()
         if asset_name.endswith((".ab", ".bin")):
             return self.unpack_ab(data, asset_name)
         if asset_name.endswith(".usm") and "video" in self.export_types:

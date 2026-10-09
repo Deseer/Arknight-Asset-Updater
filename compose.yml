@@ -17,6 +17,8 @@ services:
       ARK_DECODE_MEMORY_FACTOR: "${ARK_DECODE_MEMORY_FACTOR:-6}"
       ARK_CONTAINER_SHM_SIZE: "${ARK_CONTAINER_SHM_SIZE:-768m}"
       ARK_RECYCLE_AFTER_UPDATED_JOB: "${ARK_RECYCLE_AFTER_UPDATED_JOB:-true}"
+      ARK_SCHEMA_POLL_SECONDS: "${ARK_SCHEMA_POLL_SECONDS:-1800}"
+      ARK_SCHEMA_PROXY: "${ARK_SCHEMA_PROXY:-}"
       ARK_BOOTSTRAP_PACKS: "${ARK_BOOTSTRAP_PACKS:-true}"
       ARK_EXPORT_TYPES: "${ARK_EXPORT_TYPES:-image,spine,text,audio,mesh,video,masterdata}"
       ARK_TYPETREE_TYPES: "${ARK_TYPETREE_TYPES:-MonoBehaviour,Material,AnimatorController,AnimationClip,AssetBundle,GameObject,Transform,RectTransform,ParticleSystem,ParticleSystemRenderer,MeshRenderer,SkinnedMeshRenderer,SpriteRenderer,MonoScript}"

@@ -13,6 +13,7 @@ from unittest import mock
 from ark_resource_service.memory_unpacker import (
     MasterDataDecodeError,
     MemoryUnpacker,
+    encode_masterdata,
     install_unitypy_gzip_fallback,
     parse_export_types,
 )
@@ -75,6 +76,26 @@ class SemanticWriteTests(unittest.TestCase):
 
 
 class MasterDataDecodeTests(unittest.TestCase):
+    def test_invalid_decoded_utf8_is_rejected_before_publication(self):
+        with self.assertRaisesRegex(MasterDataDecodeError, "roguelike_topic_table"):
+            encode_masterdata("roguelike_topic_table", {"Details": {"bad\udcba": "value"}})
+
+    def test_valid_unicode_survives_json_export(self):
+        import json
+        value = {"Details": {"rogue_6": {"Name": "肉鸽中文\U0001f600"}}}
+        self.assertEqual(json.loads(encode_masterdata("roguelike_topic_table", value)), value)
+
+    def test_decoded_surrogates_are_treated_as_deterministic_schema_failure(self):
+        module = types.SimpleNamespace(__name__="src.fbs.CN.activity_table", ROOT_TYPE=object())
+        unpacker = MemoryUnpacker.__new__(MemoryUnpacker)
+        unpacker.ArkFBOLibrary = types.SimpleNamespace(CN=[module])
+        unpacker.FBOHandler = mock.Mock(return_value=mock.Mock(
+            to_json_dict=mock.Mock(return_value={"BasicInfo": {"bad": "\udcba"}})))
+        unpacker.ArkAESLibrary = mock.Mock()
+        unpacker.ArkAESLibrary.aes_cbc_decrypt_bytes.side_effect = ValueError("not encrypted json")
+        with self.assertRaisesRegex(MasterDataDecodeError, "activity_table"):
+            unpacker._decode_masterdata(b"x" * 256, "activity_table")
+
     def test_known_flatbuffer_schema_failure_is_not_silently_exported_as_raw_text(self):
         class BrokenHandler:
             def __init__(self, *_args):

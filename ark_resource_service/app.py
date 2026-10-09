@@ -27,8 +27,8 @@ CONFIG_URL = "https://ak-conf.hypergryph.com/config/prod/official/network_config
 PLATFORM = "Android"
 USER_AGENT = "ArkResourceService/1.0"
 EXPORT_LAYOUT_VERSION = "semantic-container-v1"
-TERMINAL_SKIP_REVISION = "flatbuffers-schema-v1"
-ROGUELIKE_TOPIC_SKIP_REVISION = "roguelike-topic-init-v1"
+TERMINAL_SKIP_REVISION = "flatbuffers-schema-20261009"
+ROGUELIKE_TOPIC_SKIP_REVISION = "roguelike-topic-schema-20261009"
 LOGGER = logging.getLogger("uvicorn.error")
 
 
@@ -252,6 +252,9 @@ class Service:
         self.memory_budget = MemoryBudget(self.memory_budget_mb * 1024 * 1024)
         self.unpacker_root = Path(os.getenv("ARK_UNPACKER_ROOT", "/opt/ark-unpacker"))
         self.memory_unpacker = None
+        from .schema_sync import SchemaSync
+        self.schema_sync = SchemaSync(self.root / "Schemas", float(os.getenv("ARK_SCHEMA_POLL_SECONDS", "1800")),
+                                      os.getenv("ARK_SCHEMA_PROXY", ""))
         configured_cdn_root = os.getenv("ARK_CDN_ROOT", str(config.get("cdnRoot", "")))
         self.client = OfficialClient(self.root, self.download_workers, configured_cdn_root)
         self.jobs: dict[str, Job] = {}
@@ -303,6 +306,12 @@ class Service:
 
     def run_job(self, job: Job) -> None:
         try:
+            if not job.dry_run:
+                self.update(job, "checking_schemas")
+                if self.schema_sync.refresh():
+                    # All exports from the preceding job have drained before
+                    # submit allows another job to reach this point.
+                    self.memory_unpacker = None
             self.update(job, "fetching_version")
             _, version_info = self.client.check_version(conditional=False)
             version = version_info["resVersion"]
@@ -404,7 +413,16 @@ class Service:
             and record.get("exportProfile") == self.export_profile
         ):
             return False
+        schema_sync = getattr(self, "schema_sync", None)
+        if schema_sync is not None:
+            for table, sha in record.get("schemaHashes", {}).items():
+                if schema_sync.hashes.get(table, sha) != sha:
+                    return False
         if record.get("terminalSkip"):
+            revision = record.get("schemaRevision")
+            if revision and not record.get("schemaHashes") and schema_sync is not None and schema_sync.snapshot:
+                if revision != schema_sync.snapshot["revision"]:
+                    return False
             return record.get("terminalSkipRevision") == self.terminal_skip_revision(asset)
         return True
 
@@ -431,6 +449,10 @@ class Service:
                 "outputDir": self.get_unpacker().relative_destination(asset["name"]),
                 "unpackedAt": utc_now(),
             }
+            schema_sync = getattr(self, "schema_sync", None)
+            if schema_sync is not None:
+                record["schemaHashes"] = {table: schema_sync.hashes[table]
+                    for table in self.get_unpacker().decoded_tables if table in schema_sync.hashes}
             self.records[asset["name"]] = record
             self.records_journal.parent.mkdir(parents=True, exist_ok=True)
             with self.records_journal.open("a", encoding="utf-8") as journal:
@@ -473,6 +495,11 @@ class Service:
                     "terminalSkipRevision": self.terminal_skip_revision(asset),
                     "terminalSkipError": entry["error"],
                 }
+                schema_sync = getattr(self, "schema_sync", None)
+                if schema_sync is not None and schema_sync.snapshot:
+                    record["schemaRevision"] = schema_sync.snapshot["revision"]
+                    record["schemaHashes"] = {table: sha for table, sha in schema_sync.hashes.items()
+                                              if table in entry["error"]}
                 self.records[asset["name"]] = record
                 self.records_journal.parent.mkdir(parents=True, exist_ok=True)
                 with self.records_journal.open("a", encoding="utf-8") as journal:
@@ -493,6 +520,7 @@ class Service:
                         self.root / "Logs",
                         self.export_types,
                         self.typetree_types,
+                        self.schema_sync.modules_dir,
                     )
         return self.memory_unpacker
 
@@ -743,6 +771,8 @@ class Service:
                 incomplete = state.get("versionId") != version.get("resVersion")
                 if changed or (incomplete and time.time() >= self.next_sync_attempt):
                     self.submit("version_changed" if changed else "startup_incomplete")
+                elif time.time() >= self.schema_sync.next_check and time.time() >= self.next_sync_attempt:
+                    self.submit("schema_check")
                 delay = self.poll_seconds + random.uniform(0, min(1.0, self.poll_seconds * 0.1))
             except Exception:
                 failures += 1
@@ -805,6 +835,7 @@ def runtime_config() -> dict[str, Any]:
         "exportTypes": sorted(service.export_types),
         "typeTreeTypes": sorted(service.typetree_types),
         "exportLayout": EXPORT_LAYOUT_VERSION,
+        "schemas": service.schema_sync.status(),
     }
 
 

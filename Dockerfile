@@ -4,8 +4,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends flatbuffers-compiler \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/refresh_flatbuffer_schemas.py /tmp/refresh_flatbuffer_schemas.py
+COPY scripts/flatbuffer_schemas/ /tmp/flatbuffer_schemas/
 RUN python /tmp/refresh_flatbuffer_schemas.py \
       --destination /generated \
+      --source-dir /tmp/flatbuffer_schemas \
       --work-dir /tmp/ark-fbs
 
 FROM python:3.12-slim-bookworm
@@ -17,7 +19,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     POETRY_VIRTUALENVS_CREATE=false
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ffmpeg \
+    && apt-get install -y --no-install-recommends build-essential ffmpeg flatbuffers-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/ark-unpacker

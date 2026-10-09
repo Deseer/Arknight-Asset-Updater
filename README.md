@@ -26,3 +26,11 @@ docker compose up -d --build
 
 解包部分基于 [isHarryh/Ark-Unpacker](https://github.com/isHarryh/Ark-Unpacker)，
 该部分采用 BSD-3-Clause License，详情见 `THIRD_PARTY_NOTICES.md`。
+
+## FlatBuffers schema updates
+
+The service checks `ArknightsAssets/ArknightsFlatbuffers` every 30 minutes, including when no new game resource version is published. `ARK_SCHEMA_POLL_SECONDS` controls this interval (minimum 60 seconds). `ARK_SCHEMA_PROXY` optionally supplies a proxy for schema traffic only; game CDN traffic is unchanged.
+
+All CN schemas are fetched at one immutable upstream commit, compiled with `flatc`, imported and checksum-recorded in `/state/Schemas`. Only a complete compiled snapshot is activated. Network/compilation failures retain the previous snapshot (or bundled schemas) and retry after five minutes. `/v1/config` exposes the revision, table count and last error type. This verifies compilation and JSON encoding; an upstream schema may still be semantically incompatible with a particular game version.
+
+Successful resource records retain hashes of the schemas used to decode their tables. Changed table schemas invalidate those records without invalidating unrelated assets. Known schema failures are persisted as terminal skips until a schema update permits retry. Exports reject invalid UTF-8/surrogates and non-finite JSON values before replacing canonical tables. Bundled schema sources are pinned and checksum-verified for offline image builds; automatic updates are cached separately in the state volume.

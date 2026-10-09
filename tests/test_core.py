@@ -2,6 +2,7 @@ import tempfile
 import time
 import unittest
 import threading
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -67,6 +68,17 @@ class CoreTests(unittest.TestCase):
 
             service.mark_skipped(Job(id="skip"), asset, RuntimeError("temporary failure"))
 
+            self.assertFalse(service.is_current(asset))
+
+    def test_only_changed_schema_invalidates_successful_asset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            service = self.record_service(Path(temporary))
+            asset = {"name": "anon/resource.bin", "hash": "h1", "md5": "m1"}
+            service.records[asset["name"]] = {"hash": "h1", "md5": "m1", "exportProfile": service.export_profile,
+                "schemaHashes": {"roguelike_topic_table": "old"}}
+            service.schema_sync = SimpleNamespace(hashes={"roguelike_topic_table": "old", "item_table": "new"})
+            self.assertTrue(service.is_current(asset))
+            service.schema_sync.hashes["roguelike_topic_table"] = "new"
             self.assertFalse(service.is_current(asset))
 
     @staticmethod
