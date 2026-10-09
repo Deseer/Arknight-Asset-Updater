@@ -35,6 +35,7 @@ RUN python -m pip install --no-cache-dir -r requirements-service.txt \
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/* /root/.cache
 COPY ark_resource_service/ ./ark_resource_service/
+COPY scripts/backfill_levels.py scripts/backfill_resources.py scripts/publish_backfill.py ./scripts/
 COPY vendor/Ark-Unpacker/LICENSE /licenses/Ark-Unpacker-LICENSE
 RUN mkdir -p /state /output && chown -R 501:20 /state /output
 
